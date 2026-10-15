@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Medi Tracker</title>
+  
+  <!-- PWA & Native Mobile App Meta Tags -->
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#10b981">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Medi Tracker">
+  <link rel="apple-touch-icon" href="https://cdn-icons-png.flaticon.com/512/3063/3063823.png">
+  
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  
+  <!-- FontAwesome Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+  <!-- Firebase compat SDK: configuration is supplied from the ESP32 Setup tab. -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
+  
+  <!-- Stylesheet -->
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- Welcome splash shown before authentication or the dashboard. -->
+  <div id="splash-screen" class="splash-screen" role="status" aria-label="Loading Medi Tracker">
+    <div class="splash-content">
+      <div class="splash-logo" aria-hidden="true">
+        <i class="fa-solid fa-capsules"></i>
+      </div>
+      <h1 class="splash-title">Medi Tracker</h1>
+      <p class="splash-subtitle">I'm Your Personal Healthcare Assistant... Stay Healthy &amp; Safe</p>
+      <div class="splash-loader" aria-hidden="true">
+        <span class="splash-loader-bar"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Custom tablet refill dialog -->
+  <div id="custom-refill-modal" class="refill-modal" role="dialog" aria-modal="true" aria-labelledby="refill-modal-title" aria-describedby="refill-modal-description" hidden>
+    <div class="refill-modal-card">
+      <div class="refill-modal-header">
+        <div class="refill-modal-icon" aria-hidden="true">
+          <i class="fa-solid fa-pills"></i>
+        </div>
+        <div>
+          <h2 id="refill-modal-title">Refill Container <span id="refill-container-id">1</span></h2>
+          <p id="refill-modal-description">Set current stock level after physically filling the container:</p>
+        </div>
+        <button type="button" class="refill-modal-close" aria-label="Close refill dialog" onclick="closeRefillModal()">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+
+      <form id="refill-modal-form" onsubmit="confirmRefill(event)">
+        <div class="refill-input-group">
+          <label for="refill-stock-input">Current stock level</label>
+          <div class="refill-number-wrap">
+            <input id="refill-stock-input" class="refill-number-input" type="number" min="1" max="20" step="1" inputmode="numeric" placeholder="1 - 20" autofocus required>
+            <span class="refill-number-suffix">pills</span>
+          </div>
+          <p id="refill-modal-error" class="refill-modal-error" role="alert" aria-live="polite"></p>
+        </div>
+
+        <div class="refill-quick-selects" aria-label="Quick stock values">
+          <span>Quick select</span>
+          <div class="refill-chip-list">
+            <button type="button" class="refill-chip" data-refill-value="5" onclick="selectRefillQuantity(5)">+5</button>
+            <button type="button" class="refill-chip" data-refill-value="10" onclick="selectRefillQuantity(10)">+10</button>
+            <button type="button" class="refill-chip" data-refill-value="15" onclick="selectRefillQuantity(15)">+15</button>
+            <button type="button" class="refill-chip refill-chip-max" data-refill-value="20" onclick="selectRefillQuantity(20)">Max (20)</button>
+          </div>
+        </div>
+
+        <div class="refill-modal-footer">
+          <button type="button" class="btn btn-secondary refill-cancel-btn" onclick="closeRefillModal()">Cancel</button>
+          <button type="submit" class="btn refill-confirm-btn">
+            <i class="fa-solid fa-arrows-rotate"></i>
+            Confirm &amp; Sync ESP32
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Top App Navigation Header -->
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-icon">
+        <i class="fa-solid fa-capsules"></i>
+      </div>
+      <div class="brand-title">Medi Tracker</div>
+    </div>
+
+    <div class="header-status">
+      <div class="wifi-badge offline" id="esp32-status-badge">
+        <div class="status-dot"></div>
+        <i class="fa-solid fa-wifi"></i>
+        <span id="esp32-status-label">ESP32 Offline</span>
+      </div>
+
+      <div class="user-profile" id="user-profile-badge">
+        <i class="fa-solid fa-user-circle"></i>
+        <span id="header-user-name">Guest</span>
+        <i class="fa-solid fa-right-from-bracket" style="margin-left: 0.5rem; cursor: pointer;" title="Logout" onclick="handleLogout()"></i>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main View Area -->
+  <div class="app-body">
+
+    <!-- AUTHENTICATION SECTION (Login & Registration) -->
+    <div id="auth-section" class="auth-container">
+      
+      <!-- LOGIN FORM (Matches User Screenshot) -->
+      <div id="login-form" class="auth-card">
+        <div class="auth-header">
+          <h2>Medi Tracker</h2>
+          <p style="color: var(--text-muted);">Please log in to manage medicine schedules</p>
+        </div>
+        <h3 style="text-align: center; margin-bottom: 1.5rem; font-family: 'Outfit';">Login</h3>
+        <form onsubmit="handleLogin(event)">
+          <div class="form-group">
+            <label for="login-name">Name</label>
+            <input type="text" id="login-name" class="form-control" placeholder="Name" required>
+          </div>
+          <div class="form-group">
+            <label for="login-phone">Mobile Number</label>
+            <input type="tel" id="login-phone" class="form-control" placeholder="Mobile Number" required>
+          </div>
+          <button type="button" class="btn btn-primary" style="margin-top: 1rem;" onclick="doLogin()">
+            Login
+          </button>
+          <div style="margin-top: 1rem;">
+            <button type="button" class="btn btn-accent" style="width: auto; padding: 0.6rem 1.2rem;" onclick="showAuthView('signup')">
+              Create Account
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <!-- SIGNUP / REGISTER FORM -->
+      <div id="signup-form" class="auth-card" style="display: none;">
+        <div class="auth-header">
+          <h2>Create Account / Patient Profile</h2>
+          <p style="color: var(--text-muted);">Set up your personal medical profile and IoT dispenser</p>
+        </div>
+        <form onsubmit="handleSignup(event)">
+          <div class="profile-form-section">
+            <div class="profile-form-section-title">Account &amp; Contact</div>
+            <div class="form-group">
+              <label for="signup-name">Full Name (Caregiver / Patient Name)</label>
+              <input type="text" id="signup-name" class="form-control" placeholder="John Doe" required>
+            </div>
+            <div class="profile-form-grid">
+              <div class="form-group">
+                <label for="signup-email">Email Address</label>
+                <input type="email" id="signup-email" class="form-control" placeholder="patient@example.com" required>
+              </div>
+              <div class="form-group">
+                <label for="signup-phone">Mobile Number</label>
+                <input type="tel" id="signup-phone" class="form-control" placeholder="9876543210" required>
+              </div>
+            </div>
+          </div>
+
+          <div class="profile-form-section">
+            <div class="profile-form-section-title">Medical &amp; Personal Details</div>
+            <div class="profile-form-grid">
+              <div class="form-group">
+                <label for="signup-age">Age</label>
+                <input type="number" id="signup-age" class="form-control" placeholder="45" min="1" max="120" required>
+              </div>
+              <div class="form-group">
+                <label for="signup-blood-group">Blood Group</label>
+                <select id="signup-blood-group" class="form-control" required>
+                  <option value="">Select blood group</option>
+                  <option>A+</option><option>A-</option><option>B+</option><option>B-</option>
+                  <option>O+</option><option>O-</option><option>AB+</option><option>AB-</option>
+                </select>
+              </div>
+            </div>
+
+            <label class="profile-check-row">
+              <input id="signup-has-allergies" type="checkbox" onchange="toggleProfileField('allergies')">
+              <span>Has known allergies?</span>
+            </label>
+            <div id="signup-allergies-wrap" class="profile-conditional-field" hidden>
+              <label for="signup-allergies">Specify Allergies</label>
+              <input type="text" id="signup-allergies" class="form-control" placeholder="e.g., Penicillin, peanuts">
+            </div>
+
+            <label class="profile-label">Common Conditions</label>
+            <div class="profile-condition-grid">
+              <label class="profile-check-row"><input id="condition-diabetes" type="checkbox"><span>Diabetes</span></label>
+              <label class="profile-check-row"><input id="condition-hypertension" type="checkbox"><span>Hypertension / Blood Pressure</span></label>
+              <label class="profile-check-row"><input id="condition-cholesterol" type="checkbox"><span>High Cholesterol</span></label>
+              <label class="profile-check-row"><input id="condition-gerd" type="checkbox"><span>Gastric / GERD</span></label>
+              <label class="profile-check-row"><input id="condition-other-toggle" type="checkbox" onchange="toggleProfileField('other-conditions')"><span>Other</span></label>
+            </div>
+            <div id="signup-other-conditions-wrap" class="profile-conditional-field" hidden>
+              <label for="signup-other-conditions">Specify other conditions</label>
+              <input type="text" id="signup-other-conditions" class="form-control" placeholder="Describe any other condition">
+            </div>
+            <div class="form-group">
+              <label for="signup-medical-notes">Special Medical Notes</label>
+              <textarea id="signup-medical-notes" class="form-control profile-notes-input" rows="3" placeholder="Add important clinical notes for your care team"></textarea>
+            </div>
+          </div>
+          <button type="submit" class="btn btn-primary" style="margin-top: 1rem;">
+            Create Patient Profile
+          </button>
+          <div class="auth-toggle">
+            Already registered? <a onclick="showAuthView('login')">Login here</a>
+          </div>
+        </form>
+      </div>
+
+    </div>
+
+    <!-- MAIN APP DASHBOARD SECTION -->
+    <div id="app-main" style="display: none;">
+      
+      <!-- Mobile Native Navigation Tabs -->
+      <div class="nav-tabs">
+        <button class="tab-btn active" data-tab="dashboard">
+          <i class="fa-solid fa-pills"></i> 4 Containers
+        </button>
+        <button class="tab-btn" data-tab="liquid">
+          <i class="fa-solid fa-bottle-droplet"></i> Liquid Medicine
+        </button>
+        <button class="tab-btn" data-tab="history">
+          <i class="fa-solid fa-clock-rotate-left"></i> History Log
+        </button>
+        <button class="tab-btn" data-tab="hardware">
+          <i class="fa-solid fa-microchip"></i> Settings
+        </button>
+      </div>
+
+      <!-- TAB 1: TABLET CONTAINERS DASHBOARD -->
+      <div id="tab-dashboard" class="tab-content" style="margin-top: 1.5rem;">
+        <section id="patient-overview" class="patient-overview" aria-labelledby="patient-overview-title"></section>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+          <div class="section-title" style="margin-bottom: 0;">
+            <i class="fa-solid fa-cubes" style="color: var(--primary);"></i> Tablet Containers Configuration
+          </div>
+          <button class="btn btn-secondary" style="width: auto; padding: 0.5rem 1rem;" onclick="requestNotificationAccess()">
+            <i class="fa-solid fa-bell"></i> Enable Alerts
+          </button>
+        </div>
+        <section class="adherence-widget" aria-labelledby="adherence-title">
+          <div class="section-title" id="adherence-title">
+            <i class="fa-solid fa-heart-pulse" style="color: var(--primary);"></i> Monthly Medication Adherence
+          </div>
+          <div class="adherence-rings">
+            <div class="adherence-ring-card">
+              <div class="adherence-ring" aria-label="Adherence rate">
+                <svg viewBox="0 0 120 120" role="img" aria-hidden="true">
+                  <circle class="adherence-ring-track" cx="60" cy="60" r="50"></circle>
+                  <circle id="adherence-taken-ring" class="adherence-ring-progress adherence-taken" cx="60" cy="60" r="50"></circle>
+                </svg>
+                <strong id="adherence-taken-percent">0%</strong>
+              </div>
+              <div>
+                <h3>Adherence Rate</h3>
+                <p id="adherence-taken-label">0 / 0 Days Completed</p>
+                <span>(% Taken)</span>
+              </div>
+            </div>
+            <div class="adherence-ring-card">
+              <div class="adherence-ring" aria-label="Missed doses">
+                <svg viewBox="0 0 120 120" role="img" aria-hidden="true">
+                  <circle class="adherence-ring-track" cx="60" cy="60" r="50"></circle>
+                  <circle id="adherence-missed-ring" class="adherence-ring-progress adherence-missed" cx="60" cy="60" r="50"></circle>
+                </svg>
+                <strong id="adherence-missed-percent">0%</strong>
+              </div>
+              <div>
+                <h3>Missed Doses</h3>
+                <p id="adherence-missed-label">0 Days Missed</p>
+                <span>(% Missed)</span>
+              </div>
+            </div>
+          </div>
+        </section>
+        <section class="telemetry-grid" aria-label="Live ESP32 telemetry">
+          <div class="telemetry-card">
+            <div class="telemetry-heading"><i class="fa-solid fa-droplet"></i><span>Liquid Level</span></div>
+            <strong id="telemetry-liquid-ml">-- ml</strong>
+            <div class="progress-bar"><div id="telemetry-liquid-bar" class="progress-fill" style="width: 0%"></div></div>
+            <span id="telemetry-liquid-percent" class="telemetry-meta">Waiting for sensor data</span>
+          </div>
+          <div class="telemetry-card">
+            <div class="telemetry-heading"><i class="fa-solid fa-eye"></i><span>IR Pill Sensor</span></div>
+            <span id="telemetry-ir-status" class="badge badge-muted">Idle</span>
+            <span class="telemetry-meta">Drop confirmation input</span>
+          </div>
+          <div class="telemetry-card">
+            <div class="telemetry-heading"><i class="fa-solid fa-signal"></i><span>Wi-Fi Signal</span></div>
+            <strong id="telemetry-rssi">-- dBm</strong>
+            <span id="telemetry-last-seen" class="telemetry-meta">Device not yet polled</span>
+          </div>
+        </section>
+        <div class="dashboard-grid" id="containers-grid">
+          <!-- Dynamically populated by app.js -->
+        </div>
+      </div>
+
+      <!-- TAB 2: LIQUID DISPENSER MODULE -->
+      <div id="tab-liquid" class="tab-content" style="margin-top: 1.5rem; display: none;">
+        <div class="liquid-card" id="liquid-card-content">
+          <!-- Dynamically populated by app.js -->
+        </div>
+      </div>
+
+      <!-- TAB 3: HISTORY LOG & MAINTENANCE -->
+      <div id="tab-history" class="tab-content" style="margin-top: 1.5rem; display: none;">
+        <div class="history-card">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+            <div class="section-title" style="margin-bottom: 0;">
+              <i class="fa-solid fa-list-check" style="color: var(--accent-amber);"></i> Dispensing History & Audit Log
+            </div>
+            <button class="btn btn-secondary" style="width: auto; padding: 0.5rem 1rem;" onclick="exportHistoryCSV()">
+              <i class="fa-solid fa-file-csv"></i> Export CSV
+            </button>
+          </div>
+          <div class="table-responsive">
+            <table class="custom-table">
+              <thead>
+                <tr>
+                  <th>Timestamp</th>
+                  <th>Type</th>
+                  <th>Medicine Name / Item</th>
+                  <th>Time Slot</th>
+                  <th>Status</th>
+                  <th>Dispenser</th>
+                </tr>
+              </thead>
+              <tbody id="history-tbody">
+                <!-- Dynamically rendered -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 4: HARDWARE WIRING & ESP32 CONFIGURATION -->
+      <div id="tab-hardware" class="tab-content" style="margin-top: 1.5rem; display: none;">
+        <div class="hw-info-card">
+          <div class="section-title">
+            <i class="fa-solid fa-microchip" style="color: var(--primary);"></i> ESP32 & Pin Connections
+          </div>
+          <p style="color: var(--text-muted); font-size: 0.9rem;">
+            ESP32 target on Wi-Fi <strong>ESW</strong>: <strong id="esp32-current-ip" style="color: #34d399;">192.168.8.20</strong>
+          </p>
+
+          <div style="margin-top: 1rem; background: rgba(15, 23, 42, 0.6); padding: 1rem; border-radius: 8px; border: 1px solid var(--card-border);">
+            <label style="font-size: 0.85rem; color: var(--text-muted); font-weight: 500;">Target ESP32 IP Address (from Serial Monitor)</label>
+            <div style="display: flex; gap: 0.5rem; margin-top: 0.4rem;">
+              <input type="text" id="esp32-ip-input" class="form-control" value="192.168.8.20" placeholder="e.g. 192.168.8.20" onchange="updateEsp32Ip(this.value)">
+              <button class="btn btn-primary" style="width: auto; padding: 0.5rem 1rem;" onclick="updateEsp32Ip(document.getElementById('esp32-ip-input').value)">
+                Save IP
+              </button>
+            </div>
+
+            <div class="config-panel">
+              <div class="section-title"><i class="fa-solid fa-cloud" style="color: var(--accent-blue);"></i> Firebase Realtime Database</div>
+              <p class="config-help">Optional cloud-ready configuration. Credentials remain in this browser until Firebase sync is enabled.</p>
+              <div class="config-grid">
+                <div class="form-group">
+                  <label for="firebase-api-key">apiKey</label>
+                  <input id="firebase-api-key" class="form-control" type="password" autocomplete="off" placeholder="Firebase API key">
+                </div>
+                <div class="form-group">
+                  <label for="firebase-database-url">databaseURL</label>
+                  <input id="firebase-database-url" class="form-control" type="url" placeholder="https://project-default-rtdb.firebaseio.com">
+                </div>
+                <div class="form-group">
+                  <label for="firebase-project-id">projectId</label>
+                  <input id="firebase-project-id" class="form-control" type="text" placeholder="Firebase project ID">
+                </div>
+              </div>
+              <div class="config-actions">
+                <label class="toggle-control">
+                  <input id="cloud-sync-toggle" type="checkbox" onchange="toggleCloudSync(this.checked)">
+                  <span class="toggle-slider"></span>
+                  <span>Mode: <strong id="sync-mode-label">Local ESP32 Direct</strong> | Cloud Firebase Sync</span>
+                </label>
+                <button class="btn btn-secondary config-save-btn" onclick="saveFirebaseConfig()">Save Firebase Settings</button>
+              </div>
+            </div>
+
+            <div class="diagnostics-panel">
+              <div class="section-title">
+                <i class="fa-solid fa-screwdriver-wrench" style="color: var(--accent-amber);"></i>
+                Hardware Diagnostics &amp; Test Dispense
+              </div>
+              <p class="config-help">Use these controls only for supervised hardware verification. Normal dispensing is configured from the dashboard cards.</p>
+              <div class="diagnostics-grid">
+                <button class="btn btn-secondary diagnostic-test-btn" onclick="testDispenseTablet(1)">
+                  <i class="fa-solid fa-pills"></i> Test C1
+                </button>
+                <button class="btn btn-secondary diagnostic-test-btn" onclick="testDispenseTablet(2)">
+                  <i class="fa-solid fa-pills"></i> Test C2
+                </button>
+                <button class="btn btn-secondary diagnostic-test-btn" onclick="testDispenseTablet(3)">
+                  <i class="fa-solid fa-pills"></i> Test C3
+                </button>
+                <button class="btn btn-secondary diagnostic-test-btn" onclick="testDispenseTablet(4)">
+                  <i class="fa-solid fa-pills"></i> Test C4
+                </button>
+                <button class="btn btn-accent diagnostic-test-btn diagnostic-liquid-btn" onclick="testDispenseLiquid()">
+                  <i class="fa-solid fa-pump-soap"></i> Test Liquid Pump
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="hw-grid">
+            <div class="hw-item">
+              <div class="hw-icon"><i class="fa-solid fa-wifi"></i></div>
+              <div class="hw-details">
+                <h4>Wi-Fi SSID</h4>
+                <p style="color: #34d399;">ESW</p>
+              </div>
+            </div>
+
+            <div class="hw-item">
+              <div class="hw-icon"><i class="fa-solid fa-key"></i></div>
+              <div class="hw-details">
+                <h4>Wi-Fi Password</h4>
+                <p style="color: #60a5fa;">Bpps.kjM</p>
+              </div>
+            </div>
+
+            <div class="hw-item">
+              <div class="hw-icon"><i class="fa-solid fa-gears"></i></div>
+              <div class="hw-details">
+                <h4>Servos (4 Containers)</h4>
+                <p>GPIO 13, 12, 14, 27</p>
+              </div>
+            </div>
+
+            <div class="hw-item">
+              <div class="hw-icon"><i class="fa-solid fa-water"></i></div>
+              <div class="hw-details">
+                <h4>Liquid Pump Relay</h4>
+                <p>GPIO 26</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+  </div>
+
+  <!-- App Footer -->
+  <footer class="app-footer">
+    Medi Tracker &copy; 2026
+  </footer>
+
+  <!-- Core Scripts & Service Worker -->
+  <script src="app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('sw.js').catch(err => console.log('SW reg error:', err));
+    }
+  </script>
+</body>
+</html>
