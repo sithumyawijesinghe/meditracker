@@ -517,10 +517,18 @@ async function sendESP32Command(endpoint) {
   try {
     result = await response.json();
   } catch (error) {
-    throw new Error('ESP32 returned an invalid response.');
+    throw new Error('The dispenser returned an unreadable response.');
   }
   if (!response.ok || result.error || result.status === 'EMPTY_OR_JAMMED') {
-    const error = new Error(result.error || result.message || result.status || 'ESP32 rejected the command.');
+    const rawMessage = result.error || result.message || result.status || '';
+    const friendlyMessage = rawMessage === 'EMPTY_OR_JAMMED'
+      ? 'Tablet Not Detected. Please check the container and chute.'
+      : rawMessage === 'INSUFFICIENT_STOCK'
+        ? 'Not enough tablets are available for this dose.'
+        : rawMessage === 'LOW_LIQUID_LEVEL'
+          ? 'There is not enough liquid for this dose. Please refill the bottle.'
+          : rawMessage || 'The dispenser could not complete the request.';
+    const error = new Error(friendlyMessage);
     error.code = result.message || result.status;
     throw error;
   }
@@ -555,7 +563,7 @@ async function dispenseTablet(containerId, requestedCount) {
     c.stock -= count;
     syncInventoryStock(containerId, c.stock);
     renderContainers();
-    addDispenseHistory('Tablet', `${c.name} (Container ${c.id}, ${count} tablet${count === 1 ? '' : 's'})`, `Dispensed via ESP32 Servo ${containerId}`);
+    addDispenseHistory('Tablet', `${c.name} (Container ${c.id}, ${count} tablet${count === 1 ? '' : 's'})`, 'Dispensed Successfully');
     if (window.playAlertSound) window.playAlertSound('dispense');
     showToast('Tablet Dispensed!', `${count} tablet${count === 1 ? '' : 's'} dispensed successfully.`, 'info');
     sendMobilePushNotification('Tablet Dispensed Notification', `Take ${count} tablet${count === 1 ? '' : 's'} of ${c.name}.`);
@@ -567,9 +575,9 @@ async function dispenseTablet(containerId, requestedCount) {
     if (error.code === 'EMPTY_CONTAINER') {
       showToast('Empty Container - Refill Required', `Container ${containerId} is empty.`, 'danger');
     } else if (error.code === 'EMPTY_OR_JAMMED') {
-      showToast('Dispensing Error', 'ESP32 reports EMPTY_OR_JAMMED. Check the container and chute.', 'danger');
+      showToast('Tablet Not Detected', 'Tablet Not Detected. Please check the container and chute.', 'danger');
     } else {
-      showToast('ESP32 Offline', error.message || 'The tablet command could not be completed.', 'danger');
+      showToast('Dispenser Offline', 'Dispenser Offline. Please check device power and Wi-Fi connection.', 'danger');
     }
     if (window.playAlertSound) window.playAlertSound('alert');
   }
@@ -600,13 +608,13 @@ async function dispenseLiquid() {
     liq.level = Math.round((liq.volumeMl / liq.maxVolumeMl) * 100);
     syncLiquidVolume(liq.volumeMl);
     renderLiquidModule();
-    addDispenseHistory('Liquid', `${liq.name} (${liq.doseMl} ml)`, 'Dispensed via ESP32 Pump');
+    addDispenseHistory('Liquid', `${liq.name} (${liq.doseMl} ml)`, 'Dispensed Successfully');
     if (window.playAlertSound) window.playAlertSound('dispense');
     showToast('Liquid Dispensed!', `${liq.doseMl} ml of ${liq.name} poured.`, 'info');
     sendMobilePushNotification('Liquid Medicine Notification', `${liq.doseMl} ml of ${liq.name} is ready.`);
     if (liq.level <= 20) showToast('Low Liquid Warning!', `Liquid level is down to ${liq.level}%.`, 'warning');
   } catch (error) {
-    showToast('Liquid Dispense Failed', error.message || 'The pump command could not be completed.', 'danger');
+    showToast('Liquid Dispense Failed', 'Dispenser Offline. Please check device power and Wi-Fi connection.', 'danger');
     if (window.playAlertSound) window.playAlertSound('alert');
   }
 }
@@ -641,9 +649,9 @@ async function testDispenseTablet(containerId) {
     if (error.code === 'EMPTY_CONTAINER' || error.code === 'INSUFFICIENT_STOCK') {
       showToast('Empty Container - Refill Required', `Container ${containerId} cannot complete the diagnostic test.`, 'danger');
     } else if (error.code === 'EMPTY_OR_JAMMED') {
-      showToast('Diagnostic Test Failed', 'ESP32 reports EMPTY_OR_JAMMED. Check the container and chute.', 'danger');
+      showToast('Diagnostic Test Failed', 'Tablet Not Detected. Please check the container and chute.', 'danger');
     } else {
-      showToast('Diagnostic Test Failed', error.message || 'The tablet test command could not be completed.', 'danger');
+      showToast('Diagnostic Test Failed', 'Dispenser Offline. Please check device power and Wi-Fi connection.', 'danger');
     }
     if (window.playAlertSound) window.playAlertSound('alert');
   }
@@ -676,7 +684,7 @@ async function testDispenseLiquid() {
     addDispenseHistory('System Diagnostic Test', `Liquid Pump (${liq.doseMl} ml)`, 'Verified');
     showToast('Diagnostic Test Verified', `${liq.doseMl} ml pump test completed.`, 'info');
   } catch (error) {
-    showToast('Pump Test Failed', error.message || 'The liquid pump test could not be completed.', 'danger');
+    showToast('Pump Test Failed', 'Dispenser Offline. Please check device power and Wi-Fi connection.', 'danger');
     if (window.playAlertSound) window.playAlertSound('alert');
   }
 }
@@ -703,7 +711,7 @@ async function refillLiquidBottle() {
   try {
     const result = await sendESP32Command(`/refill_liquid?volume=${volume}`);
     syncLiquidVolume(volume);
-    addDispenseHistory('Refill', `Liquid Refill: +${volume} ml`, 'Liquid bottle level updated via ESP32');
+    addDispenseHistory('Refill', `Liquid Refill: +${volume} ml`, 'Liquid bottle level updated');
     showToast('Liquid Refilled', `${volume} ml set as the new total bottle volume.`, 'info');
     return result;
   } catch (error) {
@@ -711,7 +719,7 @@ async function refillLiquidBottle() {
     liq.maxVolumeMl = previous.maxVolumeMl;
     liq.level = previous.level;
     renderLiquidModule();
-    showToast('Refill Failed', error.message || 'The ESP32 could not update the liquid level.', 'danger');
+    showToast('Refill Failed', 'Dispenser Offline. Please check device power and Wi-Fi connection.', 'danger');
     if (window.playAlertSound) window.playAlertSound('alert');
   }
 }
@@ -809,14 +817,14 @@ async function confirmRefill(event) {
     addDispenseHistory(
       'Refill',
       `Container ${containerId} Refilled: +${stock} pills`,
-      'Stock synchronized with ESP32'
+      'Stock updated on dispenser'
     );
     showToast('Container Refilled', `Container ${containerId} now has ${stock} pills.`, 'info');
   } catch (error) {
     if (error.code === 'INVALID_STOCK' || error.code === 'INVALID_CONTAINER') {
-      showToast('Refill Rejected', error.message || 'The ESP32 rejected the refill quantity.', 'danger');
+      showToast('Refill Rejected', 'Please check the container and stock quantity.', 'danger');
     } else {
-      showToast('Refill Failed', error.message || 'Could not synchronize stock with the ESP32.', 'danger');
+      showToast('Stock Sync Failed', 'Dispenser Offline. Please check device power and Wi-Fi connection.', 'danger');
     }
     if (window.playAlertSound) window.playAlertSound('alert');
   }
@@ -1017,7 +1025,7 @@ function updateTelemetryUI() {
 
   badge.classList.toggle('connected', state.telemetry.online);
   badge.classList.toggle('offline', !state.telemetry.online);
-  label.textContent = state.telemetry.online ? 'ESP32 Online' : 'ESP32 Offline';
+  label.textContent = state.telemetry.online ? 'Dispenser Online' : 'Dispenser Offline';
   if (state.telemetry.liquidMl !== null) {
     const percent = Math.min(100, Math.max(0, Math.round((state.telemetry.liquidMl / state.liquid.maxVolumeMl) * 100)));
     liquidMl.textContent = `${state.telemetry.liquidMl} ml`;
@@ -1092,7 +1100,7 @@ function saveFirebaseConfig() {
 
 function updateSyncModeLabel() {
   const label = document.getElementById('sync-mode-label');
-  if (label) label.textContent = state.firebase.cloudSync ? 'Cloud Firebase Sync' : 'Local ESP32 Direct';
+  if (label) label.textContent = state.firebase.cloudSync ? 'Cloud Sync' : 'Local Dispenser';
 }
 
 function toggleCloudSync(enabled) {
@@ -1100,7 +1108,7 @@ function toggleCloudSync(enabled) {
   localStorage.setItem('firebase_config', JSON.stringify(state.firebase));
   updateSyncModeLabel();
   if (enabled && (!state.firebase.apiKey || !state.firebase.databaseURL || !state.firebase.projectId)) {
-    showToast('Firebase Configuration Required', 'Enter apiKey, databaseURL, and projectId before enabling cloud sync.', 'warning');
+    showToast('Cloud Setup Incomplete', 'Enter all cloud project details before enabling cloud sync.', 'warning');
     document.getElementById('cloud-sync-toggle').checked = false;
     state.firebase.cloudSync = false;
     localStorage.setItem('firebase_config', JSON.stringify(state.firebase));
@@ -1118,10 +1126,10 @@ function initializeFirebase() {
     }
     firebaseDb = firebase.database();
     attachFirebaseListeners();
-    showToast('Firebase Ready', 'Realtime Database SDK initialized for telemetry and logs.', 'info');
+    showToast('Cloud Sync Ready', 'Live telemetry and history synchronization are active.', 'info');
   } catch (error) {
     firebaseDb = null;
-    showToast('Firebase Initialization Failed', error.message, 'danger');
+    showToast('Cloud Sync Unavailable', 'The dashboard will continue using direct dispenser mode.', 'danger');
   }
 }
 
@@ -1158,7 +1166,9 @@ function syncHistoryEntry(entry) {
 }
 
 function syncDispenseTrigger(command) {
-  writeFirebase('dispense_trigger', command);
+  // The browser also sends a direct ESP32 HTTP command. Mark this cloud audit
+  // record so the firmware does not execute the same request a second time.
+  writeFirebase('dispense_trigger', { ...command, source: 'web_http' });
 }
 
 function attachFirebaseListeners() {
@@ -1283,8 +1293,22 @@ function renderHistoryTable() {
       <td><strong>${item.item}</strong></td>
       <td>${item.timeSlot}</td>
       <td>
-        <span class="badge ${item.type === 'System Diagnostic Test' ? 'badge-diagnostic' : 'badge-success'}">
-          ${item.type === 'System Diagnostic Test' ? 'Diagnostic Check' : 'Taken'}
+        <span class="badge ${
+          item.type === 'System Diagnostic Test'
+            ? 'badge-diagnostic'
+            : item.type === 'Refill'
+              ? 'badge-muted'
+              : 'badge-success'
+        }">
+          ${
+            item.type === 'System Diagnostic Test'
+              ? 'Diagnostic Check'
+              : item.type === 'Refill'
+                ? 'Refill Recorded'
+                : item.type === 'Tablet' || item.type === 'Liquid'
+                  ? 'Taken'
+                  : 'Recorded'
+          }
         </span>
       </td>
       <td>${getDispenserLabel(item)}</td>
@@ -1432,7 +1456,7 @@ function checkAutomatedSchedules() {
 }
 
 function triggerScheduledDispense(slot) {
-  showToast('Automated Medicine Time!', `Triggering ${slot.toUpperCase()} scheduled medicines...`, 'info');
+  showToast('Scheduled Dose Time', `Preparing your ${slot.toUpperCase()} medicines...`, 'info');
   state.containers.filter(c => c[slot]).forEach(c => {
     dispenseTablet(c.id, c.dosage);
   });
@@ -1446,7 +1470,7 @@ function updateEsp32Ip(ip) {
   localStorage.setItem('esp32_ip', ip.trim());
   const currentIp = document.getElementById('esp32-current-ip');
   if (currentIp) currentIp.textContent = ip.trim();
-  showToast('ESP32 IP Updated', `Target ESP32 set to http://${ip.trim()}`, 'info');
+  showToast('Dispenser Address Updated', 'The dashboard will connect to the configured dispenser.', 'info');
   pollEsp32Status();
 }
 

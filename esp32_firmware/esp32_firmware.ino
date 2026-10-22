@@ -16,6 +16,8 @@
 
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <ESP32Servo.h>
@@ -44,6 +46,17 @@ void showDisplay(const char *title, const String &detail);
 uint8_t findOledAddress();
 void setPumpRelay(bool enabled);
 void sendJson(int statusCode, const String &body);
+void initializeFirebaseBridge();
+void pollFirebaseTrigger();
+void pollFirebaseConfiguration();
+void publishFirebaseStatus();
+void syncFirebaseInventory();
+void syncFirebaseHistory(const String &type, const String &item, const String &status);
+void processCloudDispense(const String &payload);
+bool firebaseRequest(const char *method, const String &path, const String &payload, String *responseBody);
+String extractJsonString(const String &json, const String &key);
+long extractJsonLong(const String &json, const String &key, long fallback);
+String jsonEscape(const String &value);
 
 // Wi-Fi Credentials
 const char *ssid = "ESW";
@@ -89,6 +102,20 @@ const float EMPTY_REFERENCE_DISTANCE_CM = 15.0f;
 float fullReferenceDistanceCm = 3.0f;
 const int IR_DROP_TIMEOUT_MS = 1500;
 const int ULTRASONIC_SAMPLE_COUNT = 5;
+
+// Firebase Realtime Database REST bridge. The database rules must permit the
+// device to read dispense_trigger and write inventory/device_status/history.
+const char *firebaseDatabaseUrl = "https://meditracker-system-default-rtdb.firebaseio.com";
+bool firebaseReady = false;
+unsigned long lastFirebaseTriggerPoll = 0;
+unsigned long lastFirebaseStatusPublish = 0;
+unsigned long lastFirebaseConfigurationPoll = 0;
+String lastProcessedTriggerSignature;
+const unsigned long FIREBASE_TRIGGER_POLL_MS = 1500;
+const unsigned long FIREBASE_STATUS_PUBLISH_MS = 5000;
+const unsigned long FIREBASE_CONFIGURATION_POLL_MS = 10000;
+int configuredLiquidDoseMl = 10;
+int configuredLiquidCalibMs = 300;
 
 // Embedded Mobile Application HTML UI
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
@@ -262,6 +289,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         showToast('Check your details', 'Enter your name, mobile number, and a password of at least 6 characters.');
         return;
       }
+      syncFirebaseInventory();
 
       localStorage.setItem('meditracker_account', JSON.stringify({ name, phone, password }));
       document.getElementById('login-phone').value = phone;
@@ -405,7 +433,7 @@ void setup() {
   // Connect to Wi-Fi
   Serial.print("Connecting to Wi-Fi SSID: ");
   Serial.println(ssid);
-  showDisplay("Connecting Wi-Fi", ssid);
+  showDisplay("Connecting...", "Please Wait");
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.begin(ssid, password);
@@ -423,18 +451,19 @@ void setup() {
     Serial.println("\n[Wi-Fi CONNECTED SUCCESS]");
     Serial.print("ESP32 Station IP Address: ");
     Serial.println(WiFi.localIP());
-    showDisplay("Wi-Fi connected", WiFi.localIP().toString());
+    showDisplay("Network Ready", "Dispenser Online");
   } else {
     Serial.println("\n[Wi-Fi Timeout - Starting ESP32 Hotspot Mode]");
     WiFi.softAP("ESP32_Medicine_Dispenser", "12345678");
     Serial.print("ESP32 Hotspot IP Address: ");
     Serial.println(WiFi.softAPIP()); // 192.168.4.1
-    showDisplay("ESP32 hotspot", WiFi.softAPIP().toString());
+    showDisplay("Setup Mode", "Connect To Device");
     digitalWrite(LED_WIFI_PIN, HIGH);
   }
 
   // Sync NTP Time
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  initializeFirebaseBridge();
 
   // Configure REST Web Server Endpoints
   server.enableCORS(true);
@@ -455,6 +484,9 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  pollFirebaseTrigger();
+  pollFirebaseConfiguration();
+  publishFirebaseStatus();
 
   // Periodic NTP Time Schedule Check for 8 AM, 12 PM, 8 PM
   checkTimeSchedules();
@@ -478,6 +510,198 @@ void sendJson(int statusCode, const String &body) {
   server.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   server.sendHeader("Access-Control-Allow-Headers", "Content-Type, Accept");
   server.send(statusCode, "application/json", body);
+}
+
+String jsonEscape(const String &value) {
+  String escaped;
+  escaped.reserve(value.length() + 8);
+  for (size_t i = 0; i < value.length(); i++) {
+    char character = value.charAt(i);
+    if (character == '"' || character == '\\') escaped += '\\';
+    if (character == '\n') {
+      escaped += "\\n";
+    } else if (character != '\r') {
+      escaped += character;
+    }
+  }
+  return escaped;
+}
+
+String extractJsonString(const String &json, const String &key) {
+  String token = "\"" + key + "\"";
+  int keyIndex = json.indexOf(token);
+  if (keyIndex < 0) return "";
+  int colonIndex = json.indexOf(':', keyIndex + token.length());
+  int startQuote = json.indexOf('"', colonIndex + 1);
+  if (colonIndex < 0 || startQuote < 0) return "";
+  int endQuote = startQuote + 1;
+  while (endQuote < json.length()) {
+    if (json.charAt(endQuote) == '"' && json.charAt(endQuote - 1) != '\\') break;
+    endQuote++;
+  }
+  if (endQuote >= json.length()) return "";
+  return json.substring(startQuote + 1, endQuote);
+}
+
+long extractJsonLong(const String &json, const String &key, long fallback) {
+  String token = "\"" + key + "\"";
+  int keyIndex = json.indexOf(token);
+  if (keyIndex < 0) return fallback;
+  int colonIndex = json.indexOf(':', keyIndex + token.length());
+  if (colonIndex < 0) return fallback;
+  int valueStart = colonIndex + 1;
+  while (valueStart < json.length() && (json.charAt(valueStart) == ' ' || json.charAt(valueStart) == '\t')) {
+    valueStart++;
+  }
+  int valueEnd = valueStart;
+  while (valueEnd < json.length() && (json.charAt(valueEnd) == '-' || isDigit(json.charAt(valueEnd)))) {
+    valueEnd++;
+  }
+  if (valueEnd == valueStart) return fallback;
+  return json.substring(valueStart, valueEnd).toInt();
+}
+
+bool firebaseRequest(const char *method, const String &path, const String &payload, String *responseBody) {
+  if (!firebaseReady || WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  String url = String(firebaseDatabaseUrl) + path + ".json";
+  if (!http.begin(client, url)) return false;
+  http.addHeader("Content-Type", "application/json");
+
+  int result = -1;
+  if (strcmp(method, "GET") == 0) {
+    result = http.GET();
+  } else if (strcmp(method, "PUT") == 0) {
+    result = http.PUT(payload);
+  } else if (strcmp(method, "PATCH") == 0) {
+    result = http.sendRequest("PATCH", payload);
+  } else if (strcmp(method, "POST") == 0) {
+    result = http.POST(payload);
+  }
+
+  if (responseBody) *responseBody = result > 0 ? http.getString() : "";
+  http.end();
+  return result >= 200 && result < 300;
+}
+
+void initializeFirebaseBridge() {
+  firebaseReady = WiFi.status() == WL_CONNECTED;
+  if (firebaseReady) {
+    Serial.println("[FIREBASE] REST bridge ready.");
+    String existingTrigger;
+    if (firebaseRequest("GET", "/dispense_trigger", "", &existingTrigger)) {
+      // Do not replay a command that was already present before this boot.
+      lastProcessedTriggerSignature = existingTrigger;
+    }
+    syncFirebaseInventory();
+    publishFirebaseStatus();
+  } else {
+    Serial.println("[FIREBASE] Offline; direct ESP32 HTTP mode remains active.");
+  }
+}
+
+void syncFirebaseInventory() {
+  if (!firebaseReady) return;
+  firebaseRequest("PUT", "/inventory/c1_stock", String(stock[0]), NULL);
+  firebaseRequest("PUT", "/inventory/c2_stock", String(stock[1]), NULL);
+  firebaseRequest("PUT", "/inventory/c3_stock", String(stock[2]), NULL);
+  firebaseRequest("PUT", "/inventory/c4_stock", String(stock[3]), NULL);
+  firebaseRequest("PUT", "/inventory/liquid_ml", String(liquidLevelMl), NULL);
+}
+
+void publishFirebaseStatus() {
+  if (!firebaseReady || millis() - lastFirebaseStatusPublish < FIREBASE_STATUS_PUBLISH_MS) return;
+  lastFirebaseStatusPublish = millis();
+  int liquidMl = readUltrasonicLiquidMl();
+  String payload = "{";
+  payload += "\"online\":true,";
+  payload += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
+  payload += "\"stock_c1\":" + String(stock[0]) + ",";
+  payload += "\"stock_c2\":" + String(stock[1]) + ",";
+  payload += "\"stock_c3\":" + String(stock[2]) + ",";
+  payload += "\"stock_c4\":" + String(stock[3]) + ",";
+  payload += "\"liquid_ml\":" + String(liquidMl) + ",";
+  payload += "\"ir_pill_detected\":" + String(digitalRead(IR_PILL_PIN) == LOW ? "true" : "false");
+  payload += "}";
+  firebaseRequest("PUT", "/device_status", payload, NULL);
+}
+
+void syncFirebaseHistory(const String &type, const String &item, const String &status) {
+  if (!firebaseReady) return;
+  String payload = "{";
+  payload += "\"timestamp\":" + String((unsigned long)millis()) + ",";
+  payload += "\"type\":\"" + jsonEscape(type) + "\",";
+  payload += "\"item\":\"" + jsonEscape(item) + "\",";
+  payload += "\"timeSlot\":\"System Diagnostic\",";
+  payload += "\"status\":\"" + jsonEscape(status) + "\"";
+  payload += "}";
+  firebaseRequest("POST", "/history", payload, NULL);
+}
+
+void processCloudDispense(const String &payload) {
+  String source = extractJsonString(payload, "source");
+  if (source == "web_http") return;
+
+  String type = extractJsonString(payload, "type");
+  long requestedAt = extractJsonLong(payload, "requestedAt", 0);
+  String signature = payload;
+  if (signature == lastProcessedTriggerSignature || type.length() == 0) return;
+  if (payload.indexOf("\"handledBy\":\"esp32\"") >= 0) return;
+  lastProcessedTriggerSignature = signature;
+
+  bool diagnostic = type == "diagnostic_tablet" || type == "diagnostic_liquid";
+  if (type == "tablet" || type == "diagnostic_tablet") {
+    long requestedContainer = extractJsonLong(payload, "container", 0);
+    long requestedCount = extractJsonLong(payload, "count", 1);
+    if (requestedContainer < 1 || requestedContainer > 4 ||
+        requestedCount < 1 || requestedCount > 5) return;
+    int id = (int)requestedContainer;
+    int count = (int)requestedCount;
+    if (stock[id - 1] < count) return;
+    int dispensed = 0;
+    dispenseTabletHardware(id, count, dispensed);
+    if (dispensed == count) {
+      syncFirebaseInventory();
+      syncFirebaseHistory(diagnostic ? "System Diagnostic Test" : "Tablet",
+                          "Container " + String(id), diagnostic ? "Verified" : "Dispensed Successfully");
+    }
+  } else if (type == "liquid" || type == "diagnostic_liquid") {
+    long requestedDose = extractJsonLong(payload, "dose", configuredLiquidDoseMl);
+    long requestedCalibration = extractJsonLong(payload, "calib_ms", configuredLiquidCalibMs);
+    if (requestedDose < 1 || requestedDose > 100 ||
+        requestedCalibration < 100 || requestedCalibration > 800) return;
+    int dose = (int)requestedDose;
+    int calibration = (int)requestedCalibration;
+    if (readUltrasonicLiquidMl() < dose) return;
+    dispenseLiquidHardware(dose, calibration);
+    syncFirebaseInventory();
+    syncFirebaseHistory(diagnostic ? "System Diagnostic Test" : "Liquid",
+                        "Liquid Pump", diagnostic ? "Verified" : "Dispensed Successfully");
+  }
+}
+
+void pollFirebaseConfiguration() {
+  if (!firebaseReady || millis() - lastFirebaseConfigurationPoll < FIREBASE_CONFIGURATION_POLL_MS) return;
+  lastFirebaseConfigurationPoll = millis();
+
+  String payload;
+  if (!firebaseRequest("GET", "/configurations/liquid", "", &payload)) return;
+  long dose = extractJsonLong(payload, "doseMl", configuredLiquidDoseMl);
+  long calibration = extractJsonLong(payload, "calib_ms", configuredLiquidCalibMs);
+  if (dose >= 1 && dose <= 100) configuredLiquidDoseMl = (int)dose;
+  if (calibration >= 100 && calibration <= 800) configuredLiquidCalibMs = (int)calibration;
+}
+
+void pollFirebaseTrigger() {
+  if (!firebaseReady || millis() - lastFirebaseTriggerPoll < FIREBASE_TRIGGER_POLL_MS) return;
+  lastFirebaseTriggerPoll = millis();
+  String payload;
+  if (firebaseRequest("GET", "/dispense_trigger", "", &payload)) {
+    processCloudDispense(payload);
+  }
 }
 
 void showDisplay(const char *title, const String &detail) {
@@ -530,11 +754,12 @@ void handleDispenseTablet() {
 
   if (stock[id - 1] < count) {
     if (stock[id - 1] == 0) {
-      showDisplay("Empty container", "Refill Required");
+      showDisplay("Container Empty", "Please Refill");
       triggerBuzzerAlert(3);
       sendJson(400, "{\"status\":\"ERROR\",\"message\":\"EMPTY_CONTAINER\"}");
       return;
     }
+    showDisplay("Low Stock", "Refill Container");
     sendJson(400, "{\"status\":\"ERROR\",\"message\":\"INSUFFICIENT_STOCK\"}");
     return;
   }
@@ -567,12 +792,14 @@ void handleDispenseLiquid() {
 
   int availableMl = readUltrasonicLiquidMl();
   if (availableMl < dose) {
+    showDisplay("Liquid Low", "Please Refill");
     sendJson(400, "{\"status\":\"ERROR\",\"message\":\"LOW_LIQUID_LEVEL\"}");
     return;
   }
 
   liquidLevelMl = availableMl;
   dispenseLiquidHardware(dose, calibMs);
+  syncFirebaseInventory();
   sendJson(200, "{\"status\":\"SUCCESS\",\"liquidDoseMl\":" + String(dose) +
                     ",\"calibMs\":" + String(calibMs) + "}");
 }
@@ -596,6 +823,7 @@ void handleRefillLiquid() {
   }
   liquidCapacityMl = volume;
   liquidLevelMl = volume;
+  syncFirebaseInventory();
 
   triggerBuzzerAlert(2);
   showDisplay("Liquid Refilled", String(volume) + " ml");
@@ -626,6 +854,7 @@ void handleRefillTablet() {
   }
 
   stock[id - 1] = requestedStock;
+  syncFirebaseInventory();
   String displayTitle = "C" + String(id) + " Refilled:";
   showDisplay(displayTitle.c_str(), String(requestedStock) + " pills");
   triggerBuzzerAlert(1);
@@ -734,7 +963,7 @@ void dispenseTabletHardware(int id, int count, int &dispensedCount) {
   if (!targetServo || stock[id - 1] < count) return;
 
   for (int cycle = 0; cycle < count; cycle++) {
-    showDisplay("Dispensing", "Opening chute...");
+    showDisplay("Dispensing", "Please Wait...");
     for (int pos = 0; pos <= 90; pos += 5) {
       targetServo->write(pos);
       delay(15);
@@ -747,7 +976,7 @@ void dispenseTabletHardware(int id, int count, int &dispensedCount) {
     }
 
     if (!dropped) {
-      showDisplay("Dispense error", "EMPTY_OR_JAMMED");
+      showDisplay("Tablet Not Found", "Check Container");
       triggerBuzzerAlert(3);
       Serial.println("[HARDWARE] No IR pill drop detected.");
       return;
