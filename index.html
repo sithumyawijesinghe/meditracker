@@ -24,6 +24,7 @@
 
   <!-- Firebase compat SDK: configuration is supplied from the ESP32 Setup tab. -->
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
   
   <!-- Stylesheet -->
@@ -131,16 +132,22 @@
         <h3 style="text-align: center; margin-bottom: 1.5rem; font-family: 'Outfit';">Login</h3>
         <form onsubmit="handleLogin(event)">
           <div class="form-group">
-            <label for="login-name">Name</label>
-            <input type="text" id="login-name" class="form-control" placeholder="Name" required>
+            <label for="login-identity">Username or Mobile Number</label>
+            <input type="text" id="login-identity" class="form-control" placeholder="your username or 9876543210" autocomplete="username" required>
           </div>
           <div class="form-group">
-            <label for="login-phone">Mobile Number</label>
-            <input type="tel" id="login-phone" class="form-control" placeholder="Mobile Number" required>
+            <label for="login-password">Password</label>
+            <div class="password-field">
+              <input type="password" id="login-password" class="form-control" placeholder="Your password" autocomplete="current-password" required>
+              <button type="button" class="password-toggle" aria-label="Show password" aria-pressed="false" onclick="togglePasswordVisibility('login-password', this)">
+                <span class="password-toggle-icon" aria-hidden="true">◉</span>
+              </button>
+            </div>
           </div>
-          <button type="button" class="btn btn-primary" style="margin-top: 1rem;" onclick="doLogin()">
+          <button type="submit" class="btn btn-primary" style="margin-top: 1rem;">
             Login
           </button>
+          <button type="button" class="auth-link-button" onclick="handleForgotPassword()">Forgot Password?</button>
           <div style="margin-top: 1rem;">
             <button type="button" class="btn btn-accent" style="width: auto; padding: 0.6rem 1.2rem;" onclick="showAuthView('signup')">
               Create Account
@@ -156,7 +163,7 @@
           <p style="color: var(--text-muted);">Set up your personal medical profile and IoT dispenser</p>
         </div>
         <form onsubmit="handleSignup(event)">
-          <div class="profile-form-section">
+          <div id="signup-step-1" class="registration-step">
             <div class="profile-form-section-title">Account &amp; Contact</div>
             <div class="form-group">
               <label for="signup-name">Full Name (Caregiver / Patient Name)</label>
@@ -165,25 +172,37 @@
             <div class="profile-form-grid">
               <div class="form-group">
                 <label for="signup-email">Email Address</label>
-                <input type="email" id="signup-email" class="form-control" placeholder="patient@example.com" required>
+                <input type="email" id="signup-email" class="form-control" placeholder="patient@example.com" autocomplete="email" required>
               </div>
               <div class="form-group">
-                <label for="signup-phone">Mobile Number</label>
-                <input type="tel" id="signup-phone" class="form-control" placeholder="9876543210" required>
+                <label for="signup-identity">Username or Mobile Number</label>
+                <input type="text" id="signup-identity" class="form-control" placeholder="Enter username" autocomplete="username" required>
               </div>
             </div>
+            <div class="form-group">
+              <label for="signup-password">Password</label>
+              <div class="password-field">
+                <input type="password" id="signup-password" class="form-control" placeholder="At least 6 characters" autocomplete="new-password" minlength="6" required>
+                <button type="button" class="password-toggle" aria-label="Show password" aria-pressed="false" onclick="togglePasswordVisibility('signup-password', this)">
+                  <span class="password-toggle-icon" aria-hidden="true">◉</span>
+                </button>
+              </div>
+            </div>
+            <button type="button" class="btn btn-primary registration-next" onclick="goToRegistrationStep(2)">
+              Next
+            </button>
           </div>
 
-          <div class="profile-form-section">
+          <div id="signup-step-2" class="registration-step" hidden>
             <div class="profile-form-section-title">Medical &amp; Personal Details</div>
             <div class="profile-form-grid">
               <div class="form-group">
                 <label for="signup-age">Age</label>
-                <input type="number" id="signup-age" class="form-control" placeholder="45" min="1" max="120" required>
+                <input type="number" id="signup-age" class="form-control" placeholder="45" min="1" max="120">
               </div>
               <div class="form-group">
                 <label for="signup-blood-group">Blood Group</label>
-                <select id="signup-blood-group" class="form-control" required>
+                <select id="signup-blood-group" class="form-control">
                   <option value="">Select blood group</option>
                   <option>A+</option><option>A-</option><option>B+</option><option>B-</option>
                   <option>O+</option><option>O-</option><option>AB+</option><option>AB-</option>
@@ -216,10 +235,11 @@
               <label for="signup-medical-notes">Special Medical Notes</label>
               <textarea id="signup-medical-notes" class="form-control profile-notes-input" rows="3" placeholder="Add important clinical notes for your care team"></textarea>
             </div>
+            <div class="registration-step-actions">
+              <button type="button" class="btn btn-secondary" onclick="goToRegistrationStep(1)">Back</button>
+              <button type="submit" class="btn btn-primary">Create Patient Profile</button>
+            </div>
           </div>
-          <button type="submit" class="btn btn-primary" style="margin-top: 1rem;">
-            Create Patient Profile
-          </button>
           <div class="auth-toggle">
             Already registered? <a onclick="showAuthView('login')">Login here</a>
           </div>

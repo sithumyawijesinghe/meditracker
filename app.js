@@ -10,14 +10,18 @@ const defaultFirebaseConfig = {
   appId: '1:1077297128468:web:8d597ed5b86ee2da00b301'
 };
 const savedFirebaseConfig = JSON.parse(localStorage.getItem('firebase_config') || 'null');
-const savedPatientProfile = JSON.parse(localStorage.getItem('patient_profile') || 'null');
 let firebaseDb = null;
+let firebaseAuth = null;
 let firebaseListenersAttached = false;
+let patientProfileRef = null;
+let authReady = false;
+let initialViewRevealed = false;
+let authListenerAttached = false;
 
 // Default Application State
 const state = {
-  currentUser: JSON.parse(localStorage.getItem('dispenser_user')) || null,
-  patientProfile: savedPatientProfile || null,
+  currentUser: null,
+  patientProfile: null,
   activeTab: 'dashboard',
   wifiConfig: {
     ssid: 'ESW',
@@ -62,6 +66,7 @@ document.addEventListener('DOMContentLoaded', () => {
   initUI();
   setupAudioSynth();
   initFirebaseConfigUI();
+  initializeFirebase();
   startStatusPolling();
 
   playSplashScreen();
@@ -102,6 +107,8 @@ function playSplashScreen() {
 }
 
 function revealInitialView() {
+  initialViewRevealed = true;
+  if (!authReady) return;
   if (state.currentUser) {
     showMainApp();
   } else {
@@ -166,6 +173,52 @@ function switchTab(tabName) {
 }
 
 // Authentication Handlers
+function normalizeAuthIdentity(value) {
+  const identity = String(value || '').trim().toLowerCase();
+  if (/^\+?[\d\s()-]+$/.test(identity)) {
+    return identity.replace(/\D/g, '');
+  }
+  return identity;
+}
+
+function getAuthPseudoEmail(value) {
+  const identity = normalizeAuthIdentity(value);
+  return `${identity}@meditracker.local`;
+}
+
+function isValidEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
+}
+
+function isValidAuthIdentity(value) {
+  const identity = normalizeAuthIdentity(value);
+  if (isValidEmail(identity)) return true;
+  return /^(?:[a-z0-9](?:[a-z0-9._-]{1,28}[a-z0-9])?|\d{7,15})$/.test(identity);
+}
+
+function getAuthAliasKey(value) {
+  return normalizeAuthIdentity(value).replace(/[.#$[\]/]/g, '_');
+}
+
+async function resolveLoginEmail(identity) {
+  if (isValidEmail(identity)) return identity;
+  if (!firebaseDb) return null;
+  const snapshot = await firebaseDb.ref(`auth_aliases/${getAuthAliasKey(identity)}`).once('value');
+  const alias = snapshot.val();
+  return alias && typeof alias.email === 'string' ? alias.email : null;
+}
+
+function togglePasswordVisibility(inputId, toggleButton) {
+  const input = document.getElementById(inputId);
+  if (!input || !toggleButton) return;
+  const shouldShow = input.type === 'password';
+  input.type = shouldShow ? 'text' : 'password';
+  toggleButton.setAttribute('aria-label', shouldShow ? 'Hide password' : 'Show password');
+  toggleButton.setAttribute('aria-pressed', String(shouldShow));
+  const icon = toggleButton.querySelector('.password-toggle-icon');
+  if (icon) icon.textContent = shouldShow ? '◉' : '◌';
+}
+
 function showAuthView(viewMode) {
   document.getElementById('app-main').style.display = 'none';
   document.getElementById('auth-section').style.display = 'flex';
@@ -179,22 +232,43 @@ function showAuthView(viewMode) {
   } else {
     loginForm.style.display = 'none';
     signupForm.style.display = 'block';
+    goToRegistrationStep(1);
   }
 }
 
-function doLogin() {
-  const nameInput = document.getElementById('login-name');
-  const phoneInput = document.getElementById('login-phone');
-  
-  const name = (nameInput && nameInput.value.trim()) ? nameInput.value.trim() : 'Patient';
-  const phone = (phoneInput && phoneInput.value.trim()) ? phoneInput.value.trim() : '9876543210';
+async function doLogin() {
+  const identityInput = document.getElementById('login-identity')?.value;
+  const password = document.getElementById('login-password')?.value;
+  const identity = normalizeAuthIdentity(identityInput);
+  if (!identity || !password) {
+    showToast('Login Required', 'Enter your username or mobile number and password.', 'warning');
+    return;
+  }
+  if (!isValidAuthIdentity(identity)) {
+    showToast('Login Details Invalid', 'Enter a valid email, username, or mobile number.', 'warning');
+    return;
+  }
+  if (!firebaseAuth) {
+    showToast('Cloud Setup Incomplete', 'Account sign-in is temporarily unavailable. Please try again shortly.', 'danger');
+    return;
+  }
 
-  state.currentUser = state.patientProfile
-    ? { ...state.patientProfile }
-    : { name, mobile: phone, age: 'N/A', email: 'N/A' };
-  localStorage.setItem('dispenser_user', JSON.stringify(state.currentUser));
-  showToast('Welcome!', `Logged in as ${name}`, 'info');
-  showMainApp();
+  try {
+    const authEmail = await resolveLoginEmail(identity);
+    if (!authEmail) {
+      showToast('Login Failed', 'No account was found for that email, username, or mobile number.', 'danger');
+      return;
+    }
+    await firebaseAuth.signInWithEmailAndPassword(authEmail, password);
+    showToast('Welcome!', 'You have signed in successfully.', 'info');
+  } catch (error) {
+    const message = error.code === 'auth/invalid-credential' || error.code === 'auth/user-not-found' || error.code === 'auth/wrong-password'
+      ? 'The username or mobile number and password do not match.'
+      : error.code === 'auth/too-many-requests'
+        ? 'Too many sign-in attempts. Please try again later.'
+        : 'We could not sign you in. Please check your details and try again.';
+    showToast('Login Failed', message, 'danger');
+  }
 }
 
 function handleLogin(event) {
@@ -202,19 +276,80 @@ function handleLogin(event) {
   doLogin();
 }
 
-function handleSignup(event) {
+async function handleForgotPassword() {
+  const identity = normalizeAuthIdentity(document.getElementById('login-identity')?.value);
+  if (!isValidEmail(identity)) {
+    showToast('Recovery Email Required', 'Enter your registered email address in the login field to receive a reset link.', 'warning');
+    document.getElementById('login-identity')?.focus();
+    return;
+  }
+  if (!firebaseAuth) {
+    showToast('Cloud Setup Incomplete', 'Password recovery is temporarily unavailable.', 'danger');
+    return;
+  }
+  try {
+    await firebaseAuth.sendPasswordResetEmail(identity);
+    showToast('Password Reset Email Sent', 'Check your inbox for a secure password reset link.', 'info');
+  } catch (error) {
+    const message = error.code === 'auth/user-not-found'
+      ? 'No account was found for that email address.'
+      : 'We could not send the reset link. Please check the address and try again.';
+    showToast('Password Reset Failed', message, 'danger');
+  }
+}
+
+function validateRegistrationStepOne() {
+  const name = document.getElementById('signup-name')?.value.trim();
+  const email = document.getElementById('signup-email')?.value.trim().toLowerCase();
+  const identity = normalizeAuthIdentity(document.getElementById('signup-identity')?.value);
+  const password = document.getElementById('signup-password')?.value;
+
+  if (!name || !email || !identity || !password) {
+    showToast('Registration Step 1', 'Complete your name, email, username or mobile number, and password.', 'warning');
+    return false;
+  }
+  if (!isValidEmail(email)) {
+    showToast('Registration Step 1', 'Enter a valid email address for password recovery.', 'warning');
+    return false;
+  }
+  if (!isValidAuthIdentity(identity) || isValidEmail(identity)) {
+    showToast('Registration Step 1', 'Use a username or mobile number in the identity field.', 'warning');
+    return false;
+  }
+  if (password.length < 6) {
+    showToast('Registration Step 1', 'Password must be at least 6 characters long.', 'warning');
+    return false;
+  }
+  return true;
+}
+
+function goToRegistrationStep(step) {
+  const stepOne = document.getElementById('signup-step-1');
+  const stepTwo = document.getElementById('signup-step-2');
+  if (!stepOne || !stepTwo) return;
+  if (step === 2 && !validateRegistrationStepOne()) return;
+  stepOne.hidden = step !== 1;
+  stepTwo.hidden = step !== 2;
+  const focusId = step === 1 ? 'signup-name' : 'signup-age';
+  document.getElementById(focusId)?.focus();
+}
+
+async function handleSignup(event) {
   event.preventDefault();
   const name = document.getElementById('signup-name').value.trim();
+  const email = document.getElementById('signup-email').value.trim().toLowerCase();
   const age = Number(document.getElementById('signup-age').value);
   const bloodGroup = document.getElementById('signup-blood-group').value;
-  const phone = document.getElementById('signup-phone').value.trim();
-  const email = document.getElementById('signup-email').value.trim();
+  const identityInput = document.getElementById('signup-identity').value;
+  const identity = normalizeAuthIdentity(identityInput);
+  const password = document.getElementById('signup-password').value;
   const hasAllergies = document.getElementById('signup-has-allergies').checked;
   const allergies = document.getElementById('signup-allergies').value.trim();
   const hasOtherCondition = document.getElementById('condition-other-toggle').checked;
   const otherConditions = document.getElementById('signup-other-conditions').value.trim();
 
-  if (!name || !Number.isInteger(age) || age < 1 || age > 120 || !bloodGroup || !phone || !email) {
+  if (!validateRegistrationStepOne()) return;
+  if (!Number.isInteger(age) || age < 1 || age > 120 || !bloodGroup) {
     showToast('Registration Error', 'Please complete all required fields.', 'danger');
     return;
   }
@@ -234,11 +369,18 @@ function handleSignup(event) {
   if (document.getElementById('condition-gerd').checked) conditions.push('Gastric / GERD');
   if (hasOtherCondition) conditions.push(otherConditions);
 
-  state.patientProfile = {
+  if (!firebaseAuth || !firebaseDb) {
+    showToast('Registration Unavailable', 'Account creation is temporarily unavailable. Please try again shortly.', 'danger');
+    return;
+  }
+
+  const profile = {
     name,
     age,
     bloodGroup,
-    mobile: phone,
+    loginId: identity,
+    username: /^\d+$/.test(identity) ? '' : identity,
+    mobile: /^\d+$/.test(identity) ? identity : '',
     email,
     hasAllergies,
     allergies: hasAllergies ? allergies : '',
@@ -246,19 +388,64 @@ function handleSignup(event) {
     medicalNotes: document.getElementById('signup-medical-notes').value.trim(),
     updatedAt: new Date().toISOString()
   };
-  state.currentUser = { ...state.patientProfile };
-  localStorage.setItem('dispenser_user', JSON.stringify(state.currentUser));
-  localStorage.setItem('patient_profile', JSON.stringify(state.patientProfile));
-  writeFirebase('patient_profile', state.patientProfile);
-  showToast('Account Created!', 'Registration successful. Welcome to IoT Dispenser.', 'info');
-  showMainApp();
+  try {
+    const credential = await firebaseAuth.createUserWithEmailAndPassword(email, password);
+    await firebaseDb.ref(`patient_profile/${credential.user.uid}`).set(profile);
+    await firebaseDb.ref(`auth_aliases/${getAuthAliasKey(identity)}`).set({
+      email,
+      uid: credential.user.uid,
+      updatedAt: new Date().toISOString()
+    });
+    state.patientProfile = profile;
+    state.currentUser = { ...profile, uid: credential.user.uid, email: credential.user.email };
+    localStorage.setItem('patient_profile', JSON.stringify(profile));
+    localStorage.setItem('dispenser_user', JSON.stringify(state.currentUser));
+    showToast('Account Created!', 'Your Medi Tracker profile is ready.', 'info');
+    showMainApp();
+  } catch (error) {
+    const message = error.code === 'auth/email-already-in-use'
+      ? 'An account already exists for this username or mobile number.'
+      : error.code === 'auth/invalid-email'
+        ? 'Enter a valid recovery email address.'
+        : 'We could not create your account. Please try again.';
+    showToast('Registration Failed', message, 'danger');
+  }
 }
 
-function handleLogout() {
+async function handleLogout() {
+  detachFirebaseListeners();
+  if (firebaseAuth) {
+    try {
+      await firebaseAuth.signOut();
+    } catch (error) {
+      console.warn('[Auth] Sign-out failed:', error);
+    }
+  }
   state.currentUser = null;
+  state.patientProfile = null;
+  state.telemetry = { online: false, liquidMl: null, irPillDetected: false, rssi: null, lastSeen: null };
   localStorage.removeItem('dispenser_user');
+  localStorage.removeItem('patient_profile');
+  sessionStorage.clear();
+  ['login-identity', 'login-password', 'signup-identity', 'signup-password'].forEach(id => {
+    const field = document.getElementById(id);
+    if (field) field.value = '';
+  });
+  document.getElementById('header-user-name').textContent = 'Guest';
   showAuthView('login');
   showToast('Logged Out', 'You have been logged out.', 'info');
+}
+
+function detachFirebaseListeners() {
+  if (!firebaseDb) return;
+  if (patientProfileRef) {
+    patientProfileRef.off();
+    patientProfileRef = null;
+  }
+  ['inventory', 'device_status', 'configurations/liquid'].forEach(path => {
+    firebaseDb.ref(path).off();
+  });
+  firebaseListenersAttached = false;
 }
 
 function showMainApp() {
@@ -1119,18 +1306,69 @@ function toggleCloudSync(enabled) {
 }
 
 function initializeFirebase() {
-  if (!state.firebase.cloudSync || !window.firebase || !state.firebase.databaseURL) return;
+  if (!window.firebase || !state.firebase.databaseURL) {
+    authReady = true;
+    if (initialViewRevealed) showAuthView('login');
+    return;
+  }
   try {
     if (!firebase.apps.length) {
       firebase.initializeApp(state.firebase);
     }
+    firebaseAuth = firebase.auth();
+    firebaseAuth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(error => {
+      console.warn('[Auth] Could not enable persistent sign-in:', error);
+    });
     firebaseDb = firebase.database();
-    attachFirebaseListeners();
-    showToast('Cloud Sync Ready', 'Live telemetry and history synchronization are active.', 'info');
+    if (!authListenerAttached) {
+      firebaseAuth.onAuthStateChanged(handleAuthStateChanged);
+      authListenerAttached = true;
+    }
+    if (state.firebase.cloudSync) {
+      attachFirebaseListeners();
+      showToast('Cloud Sync Ready', 'Live telemetry and history synchronization are active.', 'info');
+    }
   } catch (error) {
     firebaseDb = null;
+    firebaseAuth = null;
+    authReady = true;
     showToast('Cloud Sync Unavailable', 'The dashboard will continue using direct dispenser mode.', 'danger');
   }
+}
+
+async function handleAuthStateChanged(user) {
+  authReady = true;
+  if (!user) {
+    detachFirebaseListeners();
+    state.currentUser = null;
+    state.patientProfile = null;
+    localStorage.removeItem('dispenser_user');
+    localStorage.removeItem('patient_profile');
+    if (initialViewRevealed) showAuthView('login');
+    return;
+  }
+
+  state.currentUser = {
+    uid: user.uid,
+    email: user.email || '',
+    loginId: user.email ? user.email.replace(/@meditracker\.local$/i, '') : '',
+    name: user.displayName || (user.email ? user.email.replace(/@meditracker\.local$/i, '') : 'Patient')
+  };
+  localStorage.setItem('dispenser_user', JSON.stringify(state.currentUser));
+
+  if (firebaseDb) {
+    const snapshot = await firebaseDb.ref(`patient_profile/${user.uid}`).once('value');
+    if (!firebaseAuth?.currentUser || firebaseAuth.currentUser.uid !== user.uid) return;
+    const profile = snapshot.val();
+    if (profile && typeof profile === 'object') {
+      state.patientProfile = profile;
+      state.currentUser = { ...profile, uid: user.uid, email: user.email || profile.email || '' };
+      localStorage.setItem('patient_profile', JSON.stringify(profile));
+      localStorage.setItem('dispenser_user', JSON.stringify(state.currentUser));
+    }
+  }
+  if (state.firebase.cloudSync) attachFirebaseListeners();
+  if (initialViewRevealed) showMainApp();
 }
 
 function firebaseSyncEnabled() {
@@ -1172,10 +1410,12 @@ function syncDispenseTrigger(command) {
 }
 
 function attachFirebaseListeners() {
+  if (!firebaseAuth?.currentUser) return;
   if (!firebaseSyncEnabled() || firebaseListenersAttached) return;
   firebaseListenersAttached = true;
-
-  firebaseDb.ref('patient_profile').on('value', snapshot => {
+  if (patientProfileRef) patientProfileRef.off();
+  patientProfileRef = firebaseDb.ref(`patient_profile/${firebaseAuth.currentUser.uid}`);
+  patientProfileRef.on('value', snapshot => {
     const profile = snapshot.val();
     if (!profile || typeof profile !== 'object') return;
     state.patientProfile = profile;
@@ -1481,6 +1721,9 @@ if (esp32IpInput) esp32IpInput.value = state.wifiConfig.ip;
 window.handleLogin = handleLogin;
 window.doLogin = doLogin;
 window.handleSignup = handleSignup;
+window.handleForgotPassword = handleForgotPassword;
+window.togglePasswordVisibility = togglePasswordVisibility;
+window.goToRegistrationStep = goToRegistrationStep;
 window.handleLogout = handleLogout;
 window.showAuthView = showAuthView;
 window.switchTab = switchTab;
