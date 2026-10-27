@@ -3,10 +3,6 @@
   MEDI TRACKER - ESP32 STANDALONE FIRMWARE
   Final Year Project Code
 
-  Wi-Fi Credentials Pre-configured:
-    SSID: ESW
-    PASSWORD: Bpps.kjM
-
   Hotspot Fallback:
     SSID: ESP32_Medicine_Dispenser
     PASSWORD: 12345678
@@ -23,6 +19,7 @@
 #include <ESP32Servo.h>
 #include <Wire.h>
 #include <time.h>
+#include <Preferences.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
@@ -33,6 +30,7 @@ void handleDispenseLiquid();
 void handleRefillLiquid();
 void handleRefillTablet();
 void handleStatus();
+void handleWifiConfig();
 void handleNotFound();
 void dispenseTabletHardware(int id, int count, int &dispensedCount);
 void dispenseLiquidHardware(int doseMl, int calibMs);
@@ -45,10 +43,15 @@ Servo *getContainerServo(int id);
 void showDisplay(const char *title, const String &detail);
 uint8_t findOledAddress();
 void setPumpRelay(bool enabled);
+void loadWifiCredentials();
+void saveWifiCredentials(const String &newSsid, const String &newPassword);
+bool connectToConfiguredWifi();
+void startFallbackAccessPoint();
 void sendJson(int statusCode, const String &body);
 void initializeFirebaseBridge();
 void pollFirebaseTrigger();
 void pollFirebaseConfiguration();
+void loadFirebaseInventory();
 void publishFirebaseStatus();
 void syncFirebaseInventory();
 void syncFirebaseHistory(const String &type, const String &item, const String &status);
@@ -56,11 +59,13 @@ void processCloudDispense(const String &payload);
 bool firebaseRequest(const char *method, const String &path, const String &payload, String *responseBody);
 String extractJsonString(const String &json, const String &key);
 long extractJsonLong(const String &json, const String &key, long fallback);
+bool extractJsonBool(const String &json, const String &key, bool fallback);
 String jsonEscape(const String &value);
 
-// Wi-Fi Credentials
-const char *ssid = "ESW";
-const char *password = "Bpps.kjM";
+// Wi-Fi credentials are provisioned through Firebase or /wifi-config and stored in NVS.
+Preferences wifiPreferences;
+String configuredWifiSsid;
+String configuredWifiPassword;
 
 // Hardware Pin Definitions
 #define SERVO_1_PIN 13
@@ -94,9 +99,17 @@ const long gmtOffset_sec = 19800; // GMT+5:30 (India Standard Time)
 const int daylightOffset_sec = 0;
 
 // Container Stock Tracking
-int stock[4] = {20, 20, 20, 20};
-int liquidLevelMl = 200;
-int liquidCapacityMl = 200;
+int stock[4] = {0};
+int liquidLevelMl = 0;
+int liquidCapacityMl = 0;
+int containerDosage[4] = {0};
+bool containerMorning[4] = {false};
+bool containerLunch[4] = {false};
+bool containerNight[4] = {false};
+const int MAX_CONTAINER_PILLS = 30;
+bool liquidMorning = false;
+bool liquidLunch = false;
+bool liquidNight = false;
 const int MAX_LIQUID_ML = 500;
 const float EMPTY_REFERENCE_DISTANCE_CM = 15.0f;
 float fullReferenceDistanceCm = 3.0f;
@@ -106,7 +119,9 @@ const int ULTRASONIC_SAMPLE_COUNT = 5;
 // Firebase Realtime Database REST bridge. The database rules must permit the
 // device to read dispense_trigger and write inventory/device_status/history.
 const char *firebaseDatabaseUrl = "https://meditracker-system-default-rtdb.firebaseio.com";
+const char *firebaseDevicePath = "/devices/esp32_device_01";
 bool firebaseReady = false;
+bool firebaseInventoryLoaded = false;
 unsigned long lastFirebaseTriggerPoll = 0;
 unsigned long lastFirebaseStatusPublish = 0;
 unsigned long lastFirebaseConfigurationPoll = 0;
@@ -114,8 +129,8 @@ String lastProcessedTriggerSignature;
 const unsigned long FIREBASE_TRIGGER_POLL_MS = 1500;
 const unsigned long FIREBASE_STATUS_PUBLISH_MS = 5000;
 const unsigned long FIREBASE_CONFIGURATION_POLL_MS = 10000;
-int configuredLiquidDoseMl = 10;
-int configuredLiquidCalibMs = 300;
+int configuredLiquidDoseMl = 0;
+int configuredLiquidCalibMs = 0;
 
 // Embedded Mobile Application HTML UI
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
@@ -209,29 +224,29 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
           
           <div class="card">
             <h3>Container 1</h3>
-            <input type="text" class="input" value="Paracetamol 500mg" style="font-size:0.8rem;">
-            <div style="font-size:0.8rem; margin: 0.5rem 0; color:var(--muted);">Stock: <strong id="stock-1">20</strong></div>
+            <input type="text" class="input" value="" placeholder="Medicine name from Firebase" style="font-size:0.8rem;">
+            <div style="font-size:0.8rem; margin: 0.5rem 0; color:var(--muted);">Stock: <strong id="stock-1">--</strong></div>
             <button class="btn" onclick="dispensePill(1)">Dispense Now</button>
           </div>
 
           <div class="card">
             <h3>Container 2</h3>
-            <input type="text" class="input" value="Amoxicillin 250mg" style="font-size:0.8rem;">
-            <div style="font-size:0.8rem; margin: 0.5rem 0; color:var(--muted);">Stock: <strong id="stock-2">20</strong></div>
+            <input type="text" class="input" value="" placeholder="Medicine name from Firebase" style="font-size:0.8rem;">
+            <div style="font-size:0.8rem; margin: 0.5rem 0; color:var(--muted);">Stock: <strong id="stock-2">--</strong></div>
             <button class="btn" onclick="dispensePill(2)">Dispense Now</button>
           </div>
 
           <div class="card">
             <h3>Container 3</h3>
-            <input type="text" class="input" value="Vitamin C 1000mg" style="font-size:0.8rem;">
-            <div style="font-size:0.8rem; margin: 0.5rem 0; color:var(--muted);">Stock: <strong id="stock-3">20</strong></div>
+            <input type="text" class="input" value="" placeholder="Medicine name from Firebase" style="font-size:0.8rem;">
+            <div style="font-size:0.8rem; margin: 0.5rem 0; color:var(--muted);">Stock: <strong id="stock-3">--</strong></div>
             <button class="btn" onclick="dispensePill(3)">Dispense Now</button>
           </div>
 
           <div class="card">
             <h3>Container 4</h3>
-            <input type="text" class="input" value="Aspirin 81mg" style="font-size:0.8rem;">
-            <div style="font-size:0.8rem; margin: 0.5rem 0; color:var(--muted);">Stock: <strong id="stock-4">20</strong></div>
+            <input type="text" class="input" value="" placeholder="Medicine name from Firebase" style="font-size:0.8rem;">
+            <div style="font-size:0.8rem; margin: 0.5rem 0; color:var(--muted);">Stock: <strong id="stock-4">--</strong></div>
             <button class="btn" onclick="dispensePill(4)">Dispense Now</button>
           </div>
 
@@ -242,11 +257,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <div id="tab-liquid" style="display:none;">
         <div class="card">
           <h3><i class="fa-solid fa-bottle-droplet" style="color:#60a5fa;"></i> Liquid Medicine Dispenser</h3>
-          <input type="text" class="input" value="Cough Syrup (Benadryl)">
+          <input type="text" class="input" value="" placeholder="Liquid medicine name from Firebase">
           <div style="margin: 1rem 0; font-size:0.9rem;">
-            Dosage: <strong>10 ml</strong>
+            Dosage: <strong>-- ml</strong>
           </div>
-          <button class="btn btn-accent" onclick="pourLiquid()">Pour Liquid (10ml)</button>
+          <button class="btn btn-accent" onclick="pourLiquid()">Pour Liquid</button>
         </div>
       </div>
 
@@ -347,10 +362,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     }
 
     function pourLiquid() {
-      showToast('Liquid Dispensing', 'Pouring 10ml dosage...');
-      addLog('Liquid', 'Cough Syrup 10ml Poured');
+      showToast('Liquid Dispensing', 'Sending the configured liquid dose...');
+      addLog('Liquid', 'Configured liquid dose requested');
 
-      fetch('/dispense_liquid?dose=10&calib_ms=300')
+      fetch('/dispense_liquid')
         .then(r => r.json())
         .then(d => console.log('Liquid OK:', d))
         .catch(e => console.log('Fetch err:', e));
@@ -431,34 +446,17 @@ void setup() {
   delay(100);
 
   // Connect to Wi-Fi
-  Serial.print("Connecting to Wi-Fi SSID: ");
-  Serial.println(ssid);
+  loadWifiCredentials();
   showDisplay("Connecting...", "Please Wait");
 
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.begin(ssid, password);
-
-  int wifiAttempts = 0;
-  while (WiFi.status() != WL_CONNECTED && wifiAttempts < 30) {
-    delay(500);
-    Serial.print(".");
-    digitalWrite(LED_WIFI_PIN, !digitalRead(LED_WIFI_PIN));
-    wifiAttempts++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
+  if (connectToConfiguredWifi()) {
     digitalWrite(LED_WIFI_PIN, HIGH);
     Serial.println("\n[Wi-Fi CONNECTED SUCCESS]");
     Serial.print("ESP32 Station IP Address: ");
     Serial.println(WiFi.localIP());
     showDisplay("Network Ready", "Dispenser Online");
   } else {
-    Serial.println("\n[Wi-Fi Timeout - Starting ESP32 Hotspot Mode]");
-    WiFi.softAP("ESP32_Medicine_Dispenser", "12345678");
-    Serial.print("ESP32 Hotspot IP Address: ");
-    Serial.println(WiFi.softAPIP()); // 192.168.4.1
-    showDisplay("Setup Mode", "Connect To Device");
-    digitalWrite(LED_WIFI_PIN, HIGH);
+    startFallbackAccessPoint();
   }
 
   // Sync NTP Time
@@ -472,6 +470,7 @@ void setup() {
   server.on("/dispense_liquid", handleDispenseLiquid);
   server.on("/refill_liquid", handleRefillLiquid);
   server.on("/refill_tablet", handleRefillTablet);
+  server.on("/wifi-config", HTTP_POST, handleWifiConfig);
   server.on("/status", handleStatus);
   server.onNotFound(handleNotFound);
 
@@ -491,6 +490,78 @@ void loop() {
   // Periodic NTP Time Schedule Check for 8 AM, 12 PM, 8 PM
   checkTimeSchedules();
   delay(10);
+}
+
+void loadWifiCredentials() {
+  wifiPreferences.begin("wifi", true);
+  configuredWifiSsid = wifiPreferences.getString("ssid", "");
+  configuredWifiPassword = wifiPreferences.getString("password", "");
+  wifiPreferences.end();
+  Serial.print("[Wi-Fi] Stored SSID: ");
+  Serial.println(configuredWifiSsid.length() > 0 ? configuredWifiSsid : "Not configured");
+}
+
+void saveWifiCredentials(const String &newSsid, const String &newPassword) {
+  configuredWifiSsid = newSsid;
+  configuredWifiPassword = newPassword;
+  wifiPreferences.begin("wifi", false);
+  wifiPreferences.putString("ssid", configuredWifiSsid);
+  wifiPreferences.putString("password", configuredWifiPassword);
+  wifiPreferences.end();
+}
+
+bool connectToConfiguredWifi() {
+  if (configuredWifiSsid.length() == 0 || configuredWifiPassword.length() == 0) return false;
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.disconnect(true, true);
+  delay(100);
+  Serial.print("Connecting to Wi-Fi SSID: ");
+  Serial.println(configuredWifiSsid);
+  WiFi.begin(configuredWifiSsid.c_str(), configuredWifiPassword.c_str());
+
+  for (int attempt = 0; attempt < 30 && WiFi.status() != WL_CONNECTED; attempt++) {
+    delay(500);
+    Serial.print(".");
+    digitalWrite(LED_WIFI_PIN, !digitalRead(LED_WIFI_PIN));
+  }
+  Serial.println();
+  return WiFi.status() == WL_CONNECTED;
+}
+
+void startFallbackAccessPoint() {
+  Serial.println("[Wi-Fi] Credentials unavailable or connection failed; starting setup AP.");
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP("ESP32_Medicine_Dispenser", "12345678");
+  Serial.print("ESP32 Hotspot IP Address: ");
+  Serial.println(WiFi.softAPIP());
+  showDisplay("Setup Mode", "Connect To Device");
+  digitalWrite(LED_WIFI_PIN, HIGH);
+}
+
+void handleWifiConfig() {
+  if (!server.hasArg("ssid") || !server.hasArg("password")) {
+    sendJson(400, "{\"status\":\"ERROR\",\"message\":\"INVALID_WIFI_CONFIG\"}");
+    return;
+  }
+
+  String newSsid = server.arg("ssid");
+  String newPassword = server.arg("password");
+  newSsid.trim();
+  if (newSsid.length() == 0 || newPassword.length() == 0 || newSsid.length() > 32 || newPassword.length() > 63) {
+    sendJson(400, "{\"status\":\"ERROR\",\"message\":\"INVALID_WIFI_CONFIG\"}");
+    return;
+  }
+
+  saveWifiCredentials(newSsid, newPassword);
+  sendJson(200, "{\"status\":\"SUCCESS\",\"message\":\"WIFI_CONFIG_SAVED\"}");
+  delay(250);
+  if (connectToConfiguredWifi()) {
+    firebaseReady = false;
+    initializeFirebaseBridge();
+  } else {
+    startFallbackAccessPoint();
+  }
 }
 
 // REST Endpoint: Root (Serves Standalone Web Mobile App directly from ESP32!)
@@ -561,13 +632,24 @@ long extractJsonLong(const String &json, const String &key, long fallback) {
   return json.substring(valueStart, valueEnd).toInt();
 }
 
+bool extractJsonBool(const String &json, const String &key, bool fallback) {
+  String token = "\"" + key + "\"";
+  int keyIndex = json.indexOf(token);
+  if (keyIndex < 0) return fallback;
+  int colonIndex = json.indexOf(':', keyIndex + token.length());
+  if (colonIndex < 0) return fallback;
+  String value = json.substring(colonIndex + 1);
+  value.trim();
+  return value.startsWith("true") ? true : value.startsWith("false") ? false : fallback;
+}
+
 bool firebaseRequest(const char *method, const String &path, const String &payload, String *responseBody) {
   if (!firebaseReady || WiFi.status() != WL_CONNECTED) return false;
 
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  String url = String(firebaseDatabaseUrl) + path + ".json";
+  String url = String(firebaseDatabaseUrl) + String(firebaseDevicePath) + path + ".json";
   if (!http.begin(client, url)) return false;
   http.addHeader("Content-Type", "application/json");
 
@@ -596,6 +678,9 @@ void initializeFirebaseBridge() {
       // Do not replay a command that was already present before this boot.
       lastProcessedTriggerSignature = existingTrigger;
     }
+    loadFirebaseInventory();
+    lastFirebaseConfigurationPoll = millis() - FIREBASE_CONFIGURATION_POLL_MS;
+    pollFirebaseConfiguration();
     syncFirebaseInventory();
     publishFirebaseStatus();
   } else {
@@ -603,13 +688,47 @@ void initializeFirebaseBridge() {
   }
 }
 
+void loadFirebaseInventory() {
+  String payload;
+  if (!firebaseRequest("GET", "/inventory", "", &payload)) return;
+
+  bool foundValue = false;
+  bool correctedStock = false;
+  for (int index = 0; index < 4; index++) {
+    long remoteStock = extractJsonLong(payload, "c" + String(index + 1) + "_stock", -1);
+    if (remoteStock >= 0) {
+      if (remoteStock > MAX_CONTAINER_PILLS) correctedStock = true;
+      stock[index] = constrain((int)remoteStock, 0, MAX_CONTAINER_PILLS);
+      foundValue = true;
+    }
+  }
+
+  long remoteLiquid = extractJsonLong(payload, "liquid_ml", -1);
+  if (remoteLiquid >= 0 && remoteLiquid <= MAX_LIQUID_ML) {
+    liquidLevelMl = (int)remoteLiquid;
+    foundValue = true;
+  }
+  long remoteCapacity = extractJsonLong(payload, "liquid_capacity_ml", -1);
+  if (remoteCapacity >= 50 && remoteCapacity <= MAX_LIQUID_ML) {
+    liquidCapacityMl = (int)remoteCapacity;
+  }
+  firebaseInventoryLoaded = foundValue;
+  if (correctedStock) syncFirebaseInventory();
+}
+
 void syncFirebaseInventory() {
-  if (!firebaseReady) return;
+  if (!firebaseReady || !firebaseInventoryLoaded) return;
+  for (int index = 0; index < 4; index++) {
+    stock[index] = constrain(stock[index], 0, MAX_CONTAINER_PILLS);
+  }
   firebaseRequest("PUT", "/inventory/c1_stock", String(stock[0]), NULL);
   firebaseRequest("PUT", "/inventory/c2_stock", String(stock[1]), NULL);
   firebaseRequest("PUT", "/inventory/c3_stock", String(stock[2]), NULL);
   firebaseRequest("PUT", "/inventory/c4_stock", String(stock[3]), NULL);
   firebaseRequest("PUT", "/inventory/liquid_ml", String(liquidLevelMl), NULL);
+  if (liquidCapacityMl > 0) {
+    firebaseRequest("PUT", "/inventory/liquid_capacity_ml", String(liquidCapacityMl), NULL);
+  }
 }
 
 void publishFirebaseStatus() {
@@ -623,7 +742,7 @@ void publishFirebaseStatus() {
   payload += "\"stock_c2\":" + String(stock[1]) + ",";
   payload += "\"stock_c3\":" + String(stock[2]) + ",";
   payload += "\"stock_c4\":" + String(stock[3]) + ",";
-  payload += "\"liquid_ml\":" + String(liquidMl) + ",";
+  payload += "\"liquid_sensor_ml\":" + String(liquidMl) + ",";
   payload += "\"ir_pill_detected\":" + String(digitalRead(IR_PILL_PIN) == LOW ? "true" : "false");
   payload += "}";
   firebaseRequest("PUT", "/device_status", payload, NULL);
@@ -675,7 +794,9 @@ void processCloudDispense(const String &payload) {
         requestedCalibration < 100 || requestedCalibration > 800) return;
     int dose = (int)requestedDose;
     int calibration = (int)requestedCalibration;
-    if (readUltrasonicLiquidMl() < dose) return;
+    if (liquidLevelMl < dose) return;
+    int sensorLiquidMl = readUltrasonicLiquidMl();
+    if (liquidCapacityMl > 0 && sensorLiquidMl >= 0 && sensorLiquidMl < dose) return;
     dispenseLiquidHardware(dose, calibration);
     syncFirebaseInventory();
     syncFirebaseHistory(diagnostic ? "System Diagnostic Test" : "Liquid",
@@ -686,13 +807,45 @@ void processCloudDispense(const String &payload) {
 void pollFirebaseConfiguration() {
   if (!firebaseReady || millis() - lastFirebaseConfigurationPoll < FIREBASE_CONFIGURATION_POLL_MS) return;
   lastFirebaseConfigurationPoll = millis();
+  loadFirebaseInventory();
 
   String payload;
-  if (!firebaseRequest("GET", "/configurations/liquid", "", &payload)) return;
-  long dose = extractJsonLong(payload, "doseMl", configuredLiquidDoseMl);
-  long calibration = extractJsonLong(payload, "calib_ms", configuredLiquidCalibMs);
-  if (dose >= 1 && dose <= 100) configuredLiquidDoseMl = (int)dose;
-  if (calibration >= 100 && calibration <= 800) configuredLiquidCalibMs = (int)calibration;
+  String wifiPayload;
+  if (firebaseRequest("GET", "/configurations/wifi", "", &wifiPayload)) {
+    String cloudSsid = extractJsonString(wifiPayload, "ssid");
+    String cloudPassword = extractJsonString(wifiPayload, "password");
+    if (cloudSsid.length() > 0 && cloudPassword.length() > 0 &&
+        (cloudSsid != configuredWifiSsid || cloudPassword != configuredWifiPassword)) {
+      saveWifiCredentials(cloudSsid, cloudPassword);
+      if (connectToConfiguredWifi()) {
+        firebaseReady = true;
+      } else {
+        firebaseReady = false;
+        startFallbackAccessPoint();
+      }
+    }
+  }
+
+  if (firebaseRequest("GET", "/configurations/liquid", "", &payload)) {
+    long dose = extractJsonLong(payload, "doseMl", configuredLiquidDoseMl);
+    long calibration = extractJsonLong(payload, "calib_ms", configuredLiquidCalibMs);
+    if (dose >= 1 && dose <= 100) configuredLiquidDoseMl = (int)dose;
+    if (calibration >= 100 && calibration <= 800) configuredLiquidCalibMs = (int)calibration;
+    liquidMorning = extractJsonBool(payload, "morning", liquidMorning);
+    liquidLunch = extractJsonBool(payload, "lunch", liquidLunch);
+    liquidNight = extractJsonBool(payload, "night", liquidNight);
+  }
+
+  for (int index = 0; index < 4; index++) {
+    String containerPayload;
+    String path = "/configurations/containers/c" + String(index + 1);
+    if (!firebaseRequest("GET", path, "", &containerPayload)) continue;
+    long dosage = extractJsonLong(containerPayload, "dosage", containerDosage[index]);
+    if (dosage >= 1 && dosage <= 5) containerDosage[index] = (int)dosage;
+    containerMorning[index] = extractJsonBool(containerPayload, "morning", containerMorning[index]);
+    containerLunch[index] = extractJsonBool(containerPayload, "lunch", containerLunch[index]);
+    containerNight[index] = extractJsonBool(containerPayload, "night", containerNight[index]);
+  }
 }
 
 void pollFirebaseTrigger() {
@@ -790,14 +943,18 @@ void handleDispenseLiquid() {
     return;
   }
 
-  int availableMl = readUltrasonicLiquidMl();
-  if (availableMl < dose) {
+  if (liquidLevelMl < dose) {
     showDisplay("Liquid Low", "Please Refill");
     sendJson(400, "{\"status\":\"ERROR\",\"message\":\"LOW_LIQUID_LEVEL\"}");
     return;
   }
 
-  liquidLevelMl = availableMl;
+  int sensorLiquidMl = readUltrasonicLiquidMl();
+  if (liquidCapacityMl > 0 && sensorLiquidMl >= 0 && sensorLiquidMl < dose) {
+    showDisplay("Liquid Sensor Low", "Check Bottle");
+    sendJson(409, "{\"status\":\"ERROR\",\"message\":\"LIQUID_SENSOR_PROTECTION\"}");
+    return;
+  }
   dispenseLiquidHardware(dose, calibMs);
   syncFirebaseInventory();
   sendJson(200, "{\"status\":\"SUCCESS\",\"liquidDoseMl\":" + String(dose) +
@@ -848,7 +1005,7 @@ void handleRefillTablet() {
     sendJson(400, "{\"status\":\"ERROR\",\"message\":\"INVALID_CONTAINER\"}");
     return;
   }
-  if (requestedStock < 1 || requestedStock > 20) {
+  if (requestedStock < 1 || requestedStock > MAX_CONTAINER_PILLS) {
     sendJson(400, "{\"status\":\"ERROR\",\"message\":\"INVALID_STOCK\"}");
     return;
   }
@@ -923,7 +1080,7 @@ void handleStatus() {
   json += "\"stock_c2\":" + String(stock[1]) + ",";
   json += "\"stock_c3\":" + String(stock[2]) + ",";
   json += "\"stock_c4\":" + String(stock[3]) + ",";
-  json += "\"liquid_ml\":" + String(currentLiquidMl) + ",";
+  json += "\"liquid_sensor_ml\":" + String(currentLiquidMl) + ",";
   json += "\"ir_pill_detected\":" + String(pillDropped ? "true" : "false");
   json += "}";
   sendJson(200, json);
@@ -960,7 +1117,7 @@ void dispenseTabletHardware(int id, int count, int &dispensedCount) {
   Serial.println(id);
 
   Servo *targetServo = getContainerServo(id);
-  if (!targetServo || stock[id - 1] < count) return;
+  if (!targetServo || stock[id - 1] < count || stock[id - 1] > MAX_CONTAINER_PILLS) return;
 
   for (int cycle = 0; cycle < count; cycle++) {
     showDisplay("Dispensing", "Please Wait...");
@@ -1035,24 +1192,33 @@ void checkTimeSchedules() {
   if (timeinfo.tm_sec == 0) {
     if (timeinfo.tm_hour == 8 && timeinfo.tm_min == 0) {
       Serial.println("[SCHEDULE] Morning 8:00 AM Medicine Trigger");
-      int dispensed = 0;
-      dispenseTabletHardware(1, 1, dispensed);
-      dispensed = 0;
-      dispenseTabletHardware(2, 1, dispensed);
-      dispenseLiquidHardware(10, 300);
+      for (int index = 0; index < 4; index++) {
+        if (!containerMorning[index] || containerDosage[index] < 1) continue;
+        int dispensed = 0;
+        dispenseTabletHardware(index + 1, containerDosage[index], dispensed);
+      }
+      if (liquidMorning && configuredLiquidDoseMl > 0 && configuredLiquidCalibMs > 0) {
+        dispenseLiquidHardware(configuredLiquidDoseMl, configuredLiquidCalibMs);
+      }
       delay(1000);
     } else if (timeinfo.tm_hour == 12 && timeinfo.tm_min == 0) {
       Serial.println("[SCHEDULE] Lunch 12:00 PM Medicine Trigger");
-      int dispensed = 0;
-      dispenseTabletHardware(2, 1, dispensed);
-      dispenseLiquidHardware(10, 300);
+      for (int index = 0; index < 4; index++) {
+        if (!containerLunch[index] || containerDosage[index] < 1) continue;
+        int dispensed = 0;
+        dispenseTabletHardware(index + 1, containerDosage[index], dispensed);
+      }
+      if (liquidLunch && configuredLiquidDoseMl > 0 && configuredLiquidCalibMs > 0) {
+        dispenseLiquidHardware(configuredLiquidDoseMl, configuredLiquidCalibMs);
+      }
       delay(1000);
     } else if (timeinfo.tm_hour == 20 && timeinfo.tm_min == 0) {
       Serial.println("[SCHEDULE] Night 8:00 PM Medicine Trigger");
-      int dispensed = 0;
-      dispenseTabletHardware(1, 1, dispensed);
-      dispensed = 0;
-      dispenseTabletHardware(4, 1, dispensed);
+      for (int index = 0; index < 4; index++) {
+        if (!containerNight[index] || containerDosage[index] < 1) continue;
+        int dispensed = 0;
+        dispenseTabletHardware(index + 1, containerDosage[index], dispensed);
+      }
       delay(1000);
     }
   }

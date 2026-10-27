@@ -10,6 +10,8 @@ const defaultFirebaseConfig = {
   appId: '1:1077297128468:web:8d597ed5b86ee2da00b301'
 };
 const savedFirebaseConfig = JSON.parse(localStorage.getItem('firebase_config') || 'null');
+const MAX_CONTAINER_CAPACITY = 30;
+const FIREBASE_DEVICE_PATH = 'devices/esp32_device_01';
 let firebaseDb = null;
 let firebaseAuth = null;
 let firebaseListenersAttached = false;
@@ -18,34 +20,46 @@ let authReady = false;
 let initialViewRevealed = false;
 let authListenerAttached = false;
 
-// Default Application State
+function createEmptyContainer(id) {
+  return {
+    id,
+    name: '',
+    morning: false,
+    lunch: false,
+    night: false,
+    stock: null,
+    maxStock: MAX_CONTAINER_CAPACITY,
+    dosage: null
+  };
+}
+
+function createEmptyLiquidState() {
+  return {
+    name: '',
+    morning: false,
+    lunch: false,
+    night: false,
+    level: 0,
+    volumeMl: null,
+    maxVolumeMl: null,
+    doseMl: null,
+    calib_ms: null
+  };
+}
+
+// Cloud-backed application state. Empty values remain empty until Firebase hydrates them.
 const state = {
   currentUser: null,
   patientProfile: null,
   activeTab: 'dashboard',
   wifiConfig: {
-    ssid: 'ESW',
-    password: 'Bpps.kjM',
+    ssid: '',
+    password: '',
     ip: localStorage.getItem('esp32_ip') || '192.168.8.20',
-    status: 'Connected'
+    status: 'Not configured'
   },
-  containers: [
-    { id: 1, name: 'Paracetamol 500mg', morning: true, lunch: false, night: true, stock: 12, maxStock: 20, dosage: 1 },
-    { id: 2, name: 'Amoxicillin 250mg', morning: true, lunch: true, night: true, stock: 8, maxStock: 20, dosage: 1 },
-    { id: 3, name: 'Vitamin C 1000mg', morning: true, lunch: false, night: false, stock: 4, maxStock: 20, dosage: 1 },
-    { id: 4, name: 'Aspirin 81mg', morning: false, lunch: false, night: true, stock: 15, maxStock: 20, dosage: 1 }
-  ],
-  liquid: {
-    name: 'Cough Syrup (Benadryl)',
-    morning: true,
-    lunch: true,
-    night: false,
-    level: 65, // percentage
-    volumeMl: 130,
-    maxVolumeMl: 200,
-    doseMl: 10,
-    calib_ms: Number(localStorage.getItem('liquid_calib_ms')) || 250
-  },
+  containers: [1, 2, 3, 4].map(createEmptyContainer),
+  liquid: createEmptyLiquidState(),
   telemetry: {
     online: false,
     liquidMl: null,
@@ -54,12 +68,15 @@ const state = {
     lastSeen: null
   },
   firebase: { ...defaultFirebaseConfig, ...(savedFirebaseConfig || {}), cloudSync: savedFirebaseConfig?.cloudSync ?? true },
-  history: JSON.parse(localStorage.getItem('dispenser_history')) || [
-    { timestamp: '2026-09-29 08:00:00', type: 'Tablet', item: 'Paracetamol 500mg (Container 1)', timeSlot: 'Morning', status: 'Dispensed Successfully' },
-    { timestamp: '2026-09-29 08:00:05', type: 'Liquid', item: 'Cough Syrup 10ml', timeSlot: 'Morning', status: 'Dispensed Successfully' },
-    { timestamp: '2026-09-29 12:00:00', type: 'Tablet', item: 'Amoxicillin 250mg (Container 2)', timeSlot: 'Lunch', status: 'Dispensed Successfully' }
-  ]
+  history: []
 };
+
+function resetDeviceState() {
+  state.containers = [1, 2, 3, 4].map(createEmptyContainer);
+  state.liquid = createEmptyLiquidState();
+  state.telemetry = { online: false, liquidMl: null, irPillDetected: false, rssi: null, lastSeen: null };
+  state.history = [];
+}
 
 // Initialize Application
 document.addEventListener('DOMContentLoaded', () => {
@@ -70,9 +87,6 @@ document.addEventListener('DOMContentLoaded', () => {
   startStatusPolling();
 
   playSplashScreen();
-
-  // Auto-schedule simulator to check morning/lunch/night alarms
-  setInterval(checkAutomatedSchedules, 10000);
 });
 
 function playSplashScreen() {
@@ -423,7 +437,7 @@ async function handleLogout() {
   }
   state.currentUser = null;
   state.patientProfile = null;
-  state.telemetry = { online: false, liquidMl: null, irPillDetected: false, rssi: null, lastSeen: null };
+  resetDeviceState();
   localStorage.removeItem('dispenser_user');
   localStorage.removeItem('patient_profile');
   sessionStorage.clear();
@@ -442,8 +456,8 @@ function detachFirebaseListeners() {
     patientProfileRef.off();
     patientProfileRef = null;
   }
-  ['inventory', 'device_status', 'configurations/liquid'].forEach(path => {
-    firebaseDb.ref(path).off();
+  ['inventory', 'device_status', 'configurations', 'history'].forEach(path => {
+    firebaseDb.ref(`${FIREBASE_DEVICE_PATH}/${path}`).off();
   });
   firebaseListenersAttached = false;
 }
@@ -532,8 +546,10 @@ function renderContainers() {
   if (!containerGrid) return;
 
   containerGrid.innerHTML = state.containers.map(c => {
-      const isLow = c.stock <= 5;
-    const stockPercent = Math.round((c.stock / c.maxStock) * 100);
+    const isLow = Number.isInteger(c.stock) && c.stock <= 5;
+    const stockPercent = Number.isInteger(c.stock) && Number.isInteger(c.maxStock) && c.maxStock > 0
+      ? Math.round((c.stock / c.maxStock) * 100)
+      : 0;
 
     return `
       <div class="container-card ${isLow ? 'low-stock' : ''}">
@@ -546,7 +562,7 @@ function renderContainers() {
         
         <div class="form-group">
           <label>Medicine Name</label>
-          <input id="medicine-name-${c.id}" type="text" class="form-control" value="${c.name}" onchange="updateMedicineName(${c.id}, this.value)">
+          <input id="medicine-name-${c.id}" type="text" class="form-control" value="${escapeHtml(c.name)}" onchange="updateMedicineName(${c.id}, this.value)">
         </div>
 
         <div class="form-group">
@@ -554,6 +570,11 @@ function renderContainers() {
           <select id="dosage-${c.id}" class="form-control" onchange="updateDosage(${c.id}, this.value)">
             ${[1, 2, 3, 4, 5].map(count => `<option value="${count}" ${c.dosage === count ? 'selected' : ''}>${count} tablet${count === 1 ? '' : 's'}</option>`).join('')}
           </select>
+        </div>
+
+        <div class="form-group">
+          <label for="capacity-${c.id}">Container capacity</label>
+          <input id="capacity-${c.id}" type="number" class="form-control" value="${MAX_CONTAINER_CAPACITY}" readonly aria-readonly="true">
         </div>
 
         <div class="time-checkboxes">
@@ -573,7 +594,7 @@ function renderContainers() {
 
         <div class="stock-meter">
           <div class="meter-label">
-            <span>Tablet Stock: <strong>${c.stock}/${c.maxStock}</strong></span>
+            <span>Tablet Stock: <strong>${c.stock ?? '--'}/${c.maxStock ?? '--'}</strong></span>
             <span>${stockPercent}%</span>
           </div>
           <div class="progress-bar">
@@ -598,15 +619,24 @@ function renderContainers() {
 }
 
 // Render Liquid Dispenser Module
+function isLiquidFormEditing() {
+  const liquidCard = document.getElementById('liquid-card-content');
+  return Boolean(liquidCard && liquidCard.contains(document.activeElement));
+}
+
+function refreshLiquidModuleIfIdle() {
+  if (!isLiquidFormEditing()) renderLiquidModule();
+}
+
 function renderLiquidModule() {
   const liquidCard = document.getElementById('liquid-card-content');
   if (!liquidCard) return;
 
   const liq = state.liquid;
-  const sensorVolume = state.telemetry.online && state.telemetry.liquidMl !== null
-    ? state.telemetry.liquidMl
-    : liq.volumeMl;
-  const displayedLevel = Math.min(100, Math.max(0, Math.round((sensorVolume / liq.maxVolumeMl) * 100)));
+  const softwareVolume = Number.isInteger(liq.volumeMl) ? liq.volumeMl : 0;
+  const displayedLevel = liq.maxVolumeMl
+    ? Math.min(100, Math.max(0, Math.round((softwareVolume / liq.maxVolumeMl) * 100)))
+    : 0;
   const isLow = displayedLevel <= 20;
 
   liquidCard.innerHTML = `
@@ -618,7 +648,7 @@ function renderLiquidModule() {
         ${isLow ? 'CRITICAL LOW LIQUID' : 'Liquid Volume Normal'}
       </span>
       <div style="margin-top: 0.5rem; font-size: 0.9rem; font-weight: 600;">
-        ${sensorVolume} ml / ${liq.maxVolumeMl} ml (${displayedLevel}%, ${state.telemetry.online ? 'ultrasonic sensor' : 'local estimate'})
+        ${liq.volumeMl === null ? '--' : softwareVolume} ml / ${liq.maxVolumeMl ?? '--'} ml (${displayedLevel}%, software inventory)
       </div>
     </div>
 
@@ -629,12 +659,12 @@ function renderLiquidModule() {
 
       <div class="form-group">
         <label>Liquid Medicine Name</label>
-        <input type="text" class="form-control" value="${liq.name}" onchange="state.liquid.name = this.value">
+        <input id="liquid-name-input" type="text" class="form-control" value="${escapeHtml(liq.name)}" onchange="updateLiquidName(this.value)">
       </div>
 
       <div class="form-group">
         <label>Dispensary Dosage (ml)</label>
-        <input id="liquid-dose-input" type="number" class="form-control" value="${liq.doseMl ?? ''}" min="1" max="100" step="1" placeholder="1 - 100" onchange="state.liquid.doseMl = this.value === '' ? null : parseInt(this.value, 10)">
+        <input id="liquid-dose-input" type="number" class="form-control" value="${liq.doseMl ?? ''}" min="1" max="100" step="1" placeholder="1 - 100" onchange="updateLiquidDosage(this.value)">
       </div>
 
       <div class="calibration-panel">
@@ -653,7 +683,7 @@ function renderLiquidModule() {
       <div class="refill-panel">
         <div class="section-title"><i class="fa-solid fa-fill-drip" style="color: var(--primary);"></i> Refill Bottle / Set Total Liquid (ml)</div>
         <div class="refill-form">
-          <input id="liquid-refill-volume" class="form-control" type="number" min="50" max="500" step="1" placeholder="200" value="${liq.maxVolumeMl}">
+          <input id="liquid-refill-volume" class="form-control" type="number" min="50" max="500" step="1" placeholder="200" value="${liq.maxVolumeMl ?? ''}">
           <button class="btn btn-primary" type="button" onclick="refillLiquidBottle()">
             <i class="fa-solid fa-check"></i> Confirm Refill / Update Level
           </button>
@@ -689,6 +719,17 @@ function renderLiquidModule() {
       </div>
     </div>
   `;
+}
+
+function applyLiquidDispense(doseMl) {
+  const dose = Number(doseMl);
+  const currentVolume = Number(state.liquid.volumeMl);
+  if (!Number.isInteger(dose) || dose < 1 || !Number.isInteger(currentVolume)) return false;
+  state.liquid.volumeMl = Math.max(0, currentVolume - dose);
+  state.liquid.level = state.liquid.maxVolumeMl
+    ? Math.round((state.liquid.volumeMl / state.liquid.maxVolumeMl) * 100)
+    : 0;
+  return true;
 }
 
 // Send HTTP signal to physical ESP32 Microcontroller over Wi-Fi
@@ -728,6 +769,10 @@ async function dispenseTablet(containerId, requestedCount) {
   if (!c) return;
 
   const count = Number(requestedCount || c.dosage || 1);
+  if (!Number.isInteger(c.stock) || !Number.isInteger(c.dosage)) {
+    showToast('Inventory Not Ready', 'Container inventory and dosage must load from Firebase before dispensing.', 'warning');
+    return;
+  }
   if (c.stock <= 0) {
     showToast('Empty Container - Refill Required', `Container ${containerId} (${c.name}) has no pills remaining.`, 'danger');
     if (window.playAlertSound) window.playAlertSound('alert');
@@ -773,7 +818,7 @@ async function dispenseTablet(containerId, requestedCount) {
 // Liquid Dispense Logic & ESP32 Pump Signal
 async function dispenseLiquid() {
   const liq = state.liquid;
-  if (!Number.isInteger(liq.doseMl) || liq.doseMl < 1 || liq.doseMl > 100) {
+  if (!Number.isInteger(liq.doseMl) || liq.doseMl < 1 || liq.doseMl > 100 || !Number.isInteger(liq.volumeMl)) {
     showToast('Liquid Dosage Not Configured', 'Save a valid liquid dosage before dispensing.', 'warning');
     return;
   }
@@ -791,9 +836,8 @@ async function dispenseLiquid() {
       requestedAt: getFirebaseTimestamp()
     });
     await sendESP32Command(`/dispense_liquid?dose=${liq.doseMl}&calib_ms=${liq.calib_ms}`);
-    liq.volumeMl -= liq.doseMl;
-    liq.level = Math.round((liq.volumeMl / liq.maxVolumeMl) * 100);
-    syncLiquidVolume(liq.volumeMl);
+    applyLiquidDispense(liq.doseMl);
+    await syncLiquidVolume(liq.volumeMl);
     renderLiquidModule();
     addDispenseHistory('Liquid', `${liq.name} (${liq.doseMl} ml)`, 'Dispensed Successfully');
     if (window.playAlertSound) window.playAlertSound('dispense');
@@ -864,9 +908,8 @@ async function testDispenseLiquid() {
       requestedAt: getFirebaseTimestamp()
     });
     await sendESP32Command(`/dispense_liquid?dose=${liq.doseMl}&calib_ms=${liq.calib_ms}`);
-    liq.volumeMl -= liq.doseMl;
-    liq.level = Math.round((liq.volumeMl / liq.maxVolumeMl) * 100);
-    syncLiquidVolume(liq.volumeMl);
+    applyLiquidDispense(liq.doseMl);
+    await syncLiquidVolume(liq.volumeMl);
     renderLiquidModule();
     addDispenseHistory('System Diagnostic Test', `Liquid Pump (${liq.doseMl} ml)`, 'Verified');
     showToast('Diagnostic Test Verified', `${liq.doseMl} ml pump test completed.`, 'info');
@@ -878,7 +921,8 @@ async function testDispenseLiquid() {
 
 async function refillLiquidBottle() {
   const input = document.getElementById('liquid-refill-volume');
-  const volume = Number(input && input.value);
+  const rawVolume = String(input?.value ?? '').trim();
+  const volume = rawVolume === '' ? NaN : Number(rawVolume);
   if (!Number.isInteger(volume) || volume < 50 || volume > 500) {
     showToast('Invalid Refill Volume', 'Enter a whole-number volume from 50 ml to 500 ml.', 'danger');
     return;
@@ -897,7 +941,20 @@ async function refillLiquidBottle() {
 
   try {
     const result = await sendESP32Command(`/refill_liquid?volume=${volume}`);
-    syncLiquidVolume(volume);
+    await Promise.all([
+      syncLiquidVolume(volume),
+      writeFirebase('inventory/liquid_capacity_ml', volume),
+      writeFirebase('configurations/liquid', {
+        name: liq.name,
+        doseMl: liq.doseMl,
+        calib_ms: liq.calib_ms,
+        morning: liq.morning,
+        lunch: liq.lunch,
+        night: liq.night,
+        maxVolumeMl: volume,
+        updatedAt: getFirebaseTimestamp()
+      })
+    ]);
     addDispenseHistory('Refill', `Liquid Refill: +${volume} ml`, 'Liquid bottle level updated');
     showToast('Liquid Refilled', `${volume} ml set as the new total bottle volume.`, 'info');
     return result;
@@ -928,6 +985,12 @@ function refillModalElements() {
 function refillContainer(containerId) {
   const c = state.containers.find(x => x.id === containerId);
   if (!c) return;
+
+  const capacity = Number(c.maxStock);
+  if (capacity !== MAX_CONTAINER_CAPACITY) {
+    c.maxStock = MAX_CONTAINER_CAPACITY;
+    writeFirebase(`configurations/containers/c${containerId}/maxStock`, MAX_CONTAINER_CAPACITY);
+  }
 
   const elements = refillModalElements();
   if (!elements.modal || !elements.input) {
@@ -984,22 +1047,36 @@ async function confirmRefill(event) {
   const { input, error } = refillModalElements();
   if (!containerId || !input || !error) return;
 
-  const stock = Number(input.value);
-  if (!Number.isInteger(stock) || stock < 1 || stock > 20) {
-    error.textContent = 'Enter a whole number from 1 to 20 pills.';
+  const rawStock = String(input.value ?? '').trim();
+  const stock = rawStock === '' ? NaN : Number(rawStock);
+  const c = state.containers.find(item => item.id === containerId);
+  if (!c) return;
+  const maxStock = MAX_CONTAINER_CAPACITY;
+  if (Number(c.maxStock) !== MAX_CONTAINER_CAPACITY) {
+    c.maxStock = maxStock;
+    await writeFirebase(`configurations/containers/c${containerId}/maxStock`, maxStock);
+  }
+  if (stock > MAX_CONTAINER_CAPACITY) {
+    const message = 'Container capacity exceeded. Maximum capacity is 30 pills.';
+    error.textContent = message;
+    showToast('Container Capacity Exceeded', message, 'danger');
+    input.setAttribute('aria-invalid', 'true');
+    input.focus();
+    return;
+  }
+  if (!Number.isInteger(stock) || stock < 1 || stock > maxStock) {
+    error.textContent = `Enter a whole number from 1 to ${maxStock} pills.`;
     input.setAttribute('aria-invalid', 'true');
     input.focus();
     return;
   }
 
   closeRefillModal();
-  const c = state.containers.find(x => x.id === containerId);
-  if (!c) return;
 
   try {
     await sendESP32Command(`/refill_tablet?container=${containerId}&stock=${stock}`);
     c.stock = stock;
-    syncInventoryStock(containerId, c.stock);
+    await syncInventoryStock(containerId, c.stock);
     renderContainers();
     addDispenseHistory(
       'Refill',
@@ -1024,32 +1101,44 @@ document.addEventListener('keydown', event => {
 });
 
 function refillLiquid() {
-  state.liquid.volumeMl = state.liquid.maxVolumeMl;
-  state.liquid.level = 100;
-  syncLiquidVolume(state.liquid.volumeMl);
-  renderLiquidModule();
-  showToast('Liquid Bottle Refilled', 'Liquid container filled to 100% (200ml).', 'info');
-
-  const nowStr = new Date().toISOString().replace('T', ' ').substring(0, 19);
-  state.history.unshift({
-    timestamp: nowStr,
-    type: 'Refill',
-    item: `Liquid Medicine (${state.liquid.name})`,
-    timeSlot: 'Manual',
-    status: 'Volume refilled to 200ml'
-  });
-  saveHistory();
-  renderHistoryTable();
+  return refillLiquidBottle();
 }
 
 function updateMedicineName(id, name) {
   const c = state.containers.find(x => x.id === id);
-  if (c) c.name = name;
+  if (c) {
+    c.name = name.trim();
+    syncContainerConfiguration(c);
+  }
 }
 
 function updateDosage(id, value) {
   const c = state.containers.find(x => x.id === id);
-  if (c) c.dosage = Math.min(5, Math.max(1, Number(value)));
+  if (c) {
+    c.dosage = Math.min(5, Math.max(1, Number(value)));
+    syncContainerConfiguration(c);
+  }
+}
+
+function updateLiquidName(value) {
+  state.liquid.name = String(value ?? '');
+}
+
+function updateLiquidDosage(value) {
+  const rawValue = String(value ?? '').trim();
+  const dosage = rawValue === '' ? null : Number(rawValue);
+  state.liquid.doseMl = Number.isInteger(dosage) && dosage >= 1 && dosage <= 100 ? dosage : null;
+}
+
+function syncContainerConfiguration(container) {
+  return writeFirebase(`configurations/containers/c${container.id}`, {
+    name: container.name,
+    dosage: container.dosage,
+    maxStock: container.maxStock,
+    morning: container.morning,
+    lunch: container.lunch,
+    night: container.night
+  });
 }
 
 function getContainerConfigurationFromCard(containerId) {
@@ -1071,10 +1160,10 @@ function getContainerConfigurationFromCard(containerId) {
     dosageInput?.focus();
     return null;
   }
-
   return {
     name,
     dosage,
+    maxStock: MAX_CONTAINER_CAPACITY,
     morning: Boolean(morningInput?.checked),
     lunch: Boolean(lunchInput?.checked),
     night: Boolean(nightInput?.checked)
@@ -1087,36 +1176,37 @@ function saveContainerConfiguration(containerId) {
   if (!container || !configuration) return;
 
   Object.assign(container, configuration);
-  writeFirebase(`configurations/containers/c${containerId}`, configuration);
+  syncContainerConfiguration(container);
   renderContainers();
   showToast('Configuration Saved', `Container ${containerId} settings were synchronized.`, 'info');
 }
 
-function clearContainerConfiguration(containerId) {
+async function clearContainerConfiguration(containerId) {
   const container = state.containers.find(item => item.id === containerId);
   if (!container) return;
 
   Object.assign(container, {
     name: '',
     dosage: 1,
+    stock: 0,
     morning: false,
     lunch: false,
     night: false
   });
-  writeFirebase(`configurations/containers/c${containerId}`, {
-    name: '',
-    dosage: 1,
-    morning: false,
-    lunch: false,
-    night: false
-  });
+  await Promise.all([
+    syncContainerConfiguration(container),
+    syncInventoryStock(containerId, 0)
+  ]);
   renderContainers();
   showToast('Configuration Cleared', `Container ${containerId} is ready for new settings.`, 'info');
 }
 
 function toggleTimeSlot(id, slot, checked) {
   const c = state.containers.find(x => x.id === id);
-  if (c) c[slot] = checked;
+  if (c) {
+    c[slot] = checked;
+    syncContainerConfiguration(c);
+  }
 }
 
 function addDispenseHistory(type, item, status) {
@@ -1136,7 +1226,6 @@ function addDispenseHistory(type, item, status) {
 function setLiquidCalibration(value, render = true) {
   const calibration = Math.min(800, Math.max(100, Number(value)));
   state.liquid.calib_ms = calibration;
-  localStorage.setItem('liquid_calib_ms', String(calibration));
   if (render) renderLiquidModule();
   const valueLabel = document.getElementById('calibration-value');
   if (valueLabel) valueLabel.textContent = `${calibration} ms/ml`;
@@ -1165,6 +1254,7 @@ function getLiquidConfigurationFromCard() {
   }
 
   return {
+    name: state.liquid.name,
     doseMl,
     calib_ms: calibMs,
     morning: Boolean(morningInput?.checked),
@@ -1178,7 +1268,6 @@ function saveLiquidConfiguration() {
   if (!configuration) return;
 
   Object.assign(state.liquid, configuration);
-  localStorage.setItem('liquid_calib_ms', String(configuration.calib_ms));
   writeFirebase('configurations/liquid', configuration);
   renderLiquidModule();
   showToast('Liquid Configuration Saved', 'Dosage, calibration, and schedule were synchronized.', 'info');
@@ -1193,7 +1282,6 @@ function clearLiquidConfiguration() {
     night: false
   };
   Object.assign(state.liquid, configuration);
-  localStorage.setItem('liquid_calib_ms', String(configuration.calib_ms));
   writeFirebase('configurations/liquid', configuration);
   renderLiquidModule();
   showToast('Liquid Configuration Cleared', 'Dosage and schedule settings were reset.', 'info');
@@ -1244,7 +1332,7 @@ async function pollEsp32Status() {
     if (!response.ok) throw new Error(`Status request failed (${response.status}).`);
     const status = await response.json();
     state.telemetry.online = true;
-    state.telemetry.liquidMl = Number.isFinite(Number(status.liquid_ml)) ? Number(status.liquid_ml) : null;
+    state.telemetry.liquidMl = Number.isFinite(Number(status.liquid_sensor_ml)) ? Number(status.liquid_sensor_ml) : null;
     state.telemetry.irPillDetected = status.ir_pill_detected === true;
     state.telemetry.rssi = Number.isFinite(Number(status.wifi_rssi)) ? Number(status.wifi_rssi) : null;
     state.telemetry.lastSeen = new Date();
@@ -1254,7 +1342,7 @@ async function pollEsp32Status() {
     state.telemetry.rssi = null;
   }
   updateTelemetryUI();
-  if (document.getElementById('liquid-card-content')) renderLiquidModule();
+  if (document.getElementById('liquid-card-content')) refreshLiquidModuleIfIdle();
 }
 
 function startStatusPolling() {
@@ -1268,12 +1356,79 @@ function initFirebaseConfigUI() {
   const databaseURL = document.getElementById('firebase-database-url');
   const projectId = document.getElementById('firebase-project-id');
   const toggle = document.getElementById('cloud-sync-toggle');
+  const wifiSsid = document.getElementById('wifi-ssid-input');
+  const wifiPassword = document.getElementById('wifi-password-input');
   if (apiKey) apiKey.value = config.apiKey;
   if (databaseURL) databaseURL.value = config.databaseURL;
   if (projectId) projectId.value = config.projectId;
   if (toggle) toggle.checked = config.cloudSync;
+  if (wifiSsid) wifiSsid.value = state.wifiConfig.ssid;
+  if (wifiPassword) wifiPassword.value = state.wifiConfig.password;
+  updateWifiConfigUI();
   updateSyncModeLabel();
   if (config.cloudSync) initializeFirebase();
+}
+
+function updateWifiConfigUI() {
+  const label = document.getElementById('configured-wifi-label');
+  const hardwareLabel = document.getElementById('hardware-wifi-ssid');
+  const targetLabel = document.getElementById('esp32-current-ssid');
+  const networkLabel = state.wifiConfig.ssid || 'Not configured';
+  if (label) label.textContent = networkLabel;
+  if (hardwareLabel) hardwareLabel.textContent = networkLabel;
+  if (targetLabel) targetLabel.textContent = networkLabel;
+}
+
+async function provisionEsp32Wifi(ssid, password) {
+  const ip = state.wifiConfig.ip.trim();
+  if (!ip) return;
+  const response = await fetch(`http://${ip}/wifi-config`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: new URLSearchParams({ ssid, password }).toString(),
+    signal: AbortSignal.timeout(8000)
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.status !== 'SUCCESS') {
+    throw new Error(result.message || 'The ESP32 rejected the Wi-Fi settings.');
+  }
+  return result;
+}
+
+async function saveWifiConfig() {
+  const ssidInput = document.getElementById('wifi-ssid-input');
+  const passwordInput = document.getElementById('wifi-password-input');
+  const ssid = ssidInput?.value.trim() || '';
+  const password = passwordInput?.value || '';
+  if (!firebaseSyncEnabled()) {
+    showToast('Cloud Sync Required', 'Enable Firebase Cloud Sync before saving Wi-Fi settings.', 'warning');
+    return;
+  }
+  if (!ssid || !password) {
+    showToast('Wi-Fi Settings Required', 'Enter both the Wi-Fi SSID and password.', 'warning');
+    return;
+  }
+
+  state.wifiConfig.ssid = ssid;
+  state.wifiConfig.password = password;
+  state.wifiConfig.status = 'Saving';
+  updateWifiConfigUI();
+  try {
+    await writeFirebase('configurations/wifi', {
+      ssid,
+      password,
+      updatedAt: getFirebaseTimestamp()
+    });
+    await provisionEsp32Wifi(ssid, password);
+    state.wifiConfig.status = 'Saved';
+    showToast('Wi-Fi Settings Saved', 'Firebase and the ESP32 received the new network credentials.', 'info');
+  } catch (error) {
+    state.wifiConfig.status = 'Cloud only';
+    showToast('Wi-Fi Provisioning Incomplete', error.message || 'Credentials were saved to Firebase but the ESP32 could not be reached.', 'warning');
+  }
 }
 
 function saveFirebaseConfig() {
@@ -1342,12 +1497,14 @@ async function handleAuthStateChanged(user) {
     detachFirebaseListeners();
     state.currentUser = null;
     state.patientProfile = null;
+    resetDeviceState();
     localStorage.removeItem('dispenser_user');
     localStorage.removeItem('patient_profile');
     if (initialViewRevealed) showAuthView('login');
     return;
   }
 
+  resetDeviceState();
   state.currentUser = {
     uid: user.uid,
     email: user.email || '',
@@ -1367,7 +1524,10 @@ async function handleAuthStateChanged(user) {
       localStorage.setItem('dispenser_user', JSON.stringify(state.currentUser));
     }
   }
-  if (state.firebase.cloudSync) attachFirebaseListeners();
+  if (state.firebase.cloudSync) {
+    attachFirebaseListeners();
+    await loadDeviceState();
+  }
   if (initialViewRevealed) showMainApp();
 }
 
@@ -1383,23 +1543,35 @@ function getFirebaseTimestamp() {
 
 function writeFirebase(path, value) {
   if (!firebaseSyncEnabled()) return;
-  firebaseDb.ref(path).set(value).catch(error => {
+  return firebaseDb.ref(`${FIREBASE_DEVICE_PATH}/${path}`).set(value).catch(error => {
     console.warn(`[Firebase] Could not write ${path}:`, error);
+    throw error;
   });
 }
 
 function syncInventoryStock(containerId, stock) {
-  writeFirebase(`inventory/c${containerId}_stock`, stock);
+  if (!firebaseSyncEnabled()) return Promise.resolve();
+  const normalizedStock = Number(stock);
+  if (!Number.isInteger(normalizedStock) || normalizedStock < 0 || normalizedStock > MAX_CONTAINER_CAPACITY) {
+    return Promise.reject(new Error('Inventory stock exceeds the 30-pill container capacity.'));
+  }
+  return writeFirebase(`inventory/c${containerId}_stock`, normalizedStock);
 }
 
 function syncLiquidVolume(volumeMl) {
-  writeFirebase('inventory/liquid_ml', volumeMl);
+  if (!firebaseSyncEnabled()) return Promise.resolve();
+  const normalizedVolume = Number(volumeMl);
+  if (!Number.isInteger(normalizedVolume) || normalizedVolume < 0 || normalizedVolume > 500) {
+    return Promise.reject(new Error('Invalid liquid volume.'));
+  }
+  return writeFirebase('inventory/liquid_ml', normalizedVolume);
 }
 
 function syncHistoryEntry(entry) {
   if (!firebaseSyncEnabled()) return;
-  firebaseDb.ref('history').push(entry).catch(error => {
+  return firebaseDb.ref(`${FIREBASE_DEVICE_PATH}/history`).push(entry).catch(error => {
     console.warn('[Firebase] Could not append history:', error);
+    throw error;
   });
 }
 
@@ -1407,6 +1579,81 @@ function syncDispenseTrigger(command) {
   // The browser also sends a direct ESP32 HTTP command. Mark this cloud audit
   // record so the firmware does not execute the same request a second time.
   writeFirebase('dispense_trigger', { ...command, source: 'web_http' });
+}
+
+async function loadDeviceState() {
+  if (!firebaseSyncEnabled() || !firebaseAuth?.currentUser) return;
+  const userId = firebaseAuth.currentUser.uid;
+
+  try {
+    const devicePath = `${FIREBASE_DEVICE_PATH}`;
+    const [inventorySnapshot, configurationsSnapshot, historySnapshot] = await Promise.all([
+      firebaseDb.ref(`${devicePath}/inventory`).once('value'),
+      firebaseDb.ref(`${devicePath}/configurations`).once('value'),
+      firebaseDb.ref(`${devicePath}/history`).once('value')
+    ]);
+    if (!firebaseAuth?.currentUser || firebaseAuth.currentUser.uid !== userId) return;
+
+    const inventory = inventorySnapshot.val() || {};
+    state.containers.forEach(container => {
+      const remoteStock = Number(inventory[`c${container.id}_stock`]);
+      container.maxStock = MAX_CONTAINER_CAPACITY;
+      if (Number.isInteger(remoteStock) && remoteStock >= 0) {
+        container.stock = Math.min(remoteStock, MAX_CONTAINER_CAPACITY);
+      }
+    });
+    const remoteLiquid = Number(inventory.liquid_ml);
+    if (Number.isFinite(remoteLiquid) && remoteLiquid >= 0) state.liquid.volumeMl = remoteLiquid;
+    const remoteCapacity = Number(inventory.liquid_capacity_ml);
+    if (Number.isInteger(remoteCapacity) && remoteCapacity >= 50 && remoteCapacity <= 500) {
+      state.liquid.maxVolumeMl = remoteCapacity;
+    }
+
+    const configurations = configurationsSnapshot.val() || {};
+    const containerConfigurations = configurations.containers || {};
+    state.containers.forEach(container => {
+      const configuration = containerConfigurations[`c${container.id}`];
+      if (!configuration || typeof configuration !== 'object') return;
+      if (typeof configuration.name === 'string') container.name = configuration.name;
+      ['morning', 'lunch', 'night'].forEach(slot => {
+        if (typeof configuration[slot] === 'boolean') container[slot] = configuration[slot];
+      });
+      const dosage = Number(configuration.dosage);
+      if (Number.isInteger(dosage) && dosage >= 1 && dosage <= 5) container.dosage = dosage;
+    });
+
+    const liquidConfiguration = configurations.liquid;
+    if (liquidConfiguration && typeof liquidConfiguration === 'object') {
+      if (typeof liquidConfiguration.name === 'string') state.liquid.name = liquidConfiguration.name;
+      const doseMl = Number(liquidConfiguration.doseMl);
+      const calibMs = Number(liquidConfiguration.calib_ms);
+      if (liquidConfiguration.doseMl === null) state.liquid.doseMl = null;
+      else if (Number.isInteger(doseMl) && doseMl >= 1 && doseMl <= 100) state.liquid.doseMl = doseMl;
+      if (Number.isInteger(calibMs) && calibMs >= 100 && calibMs <= 800) state.liquid.calib_ms = calibMs;
+      ['morning', 'lunch', 'night'].forEach(slot => {
+        if (typeof liquidConfiguration[slot] === 'boolean') state.liquid[slot] = liquidConfiguration[slot];
+      });
+      const maxVolumeMl = Number(liquidConfiguration.maxVolumeMl);
+      if (Number.isInteger(maxVolumeMl) && maxVolumeMl >= 50 && maxVolumeMl <= 500) {
+        state.liquid.maxVolumeMl = maxVolumeMl;
+      }
+    }
+
+    if (state.liquid.maxVolumeMl && state.liquid.volumeMl !== null) {
+      state.liquid.level = Math.min(100, Math.max(0, Math.round((state.liquid.volumeMl / state.liquid.maxVolumeMl) * 100)));
+    }
+
+    const records = historySnapshot.val() || {};
+    state.history = Object.entries(records)
+      .map(([id, entry]) => ({ ...entry, id }))
+      .sort((left, right) => String(right.timestamp || '').localeCompare(String(left.timestamp || '')));
+
+    renderContainers();
+    refreshLiquidModuleIfIdle();
+    renderHistoryTable();
+  } catch (error) {
+    console.warn('[Firebase] Initial device state load failed:', error);
+  }
 }
 
 function attachFirebaseListeners() {
@@ -1429,41 +1676,96 @@ function attachFirebaseListeners() {
     console.warn('[Firebase] Patient profile listener failed:', error);
   });
 
-  firebaseDb.ref('inventory').on('value', snapshot => {
+  firebaseDb.ref(`${FIREBASE_DEVICE_PATH}/inventory`).on('value', snapshot => {
     const inventory = snapshot.val() || {};
     state.containers.forEach(container => {
       const remoteStock = Number(inventory[`c${container.id}_stock`]);
-      if (Number.isInteger(remoteStock) && remoteStock >= 0 && remoteStock <= container.maxStock) {
-        container.stock = remoteStock;
+      const remoteMaxStock = Number(inventory[`c${container.id}_maxStock`]);
+      container.maxStock = MAX_CONTAINER_CAPACITY;
+      if (Number.isInteger(remoteStock) && remoteStock >= 0) {
+        container.stock = Math.min(remoteStock, MAX_CONTAINER_CAPACITY);
+        if (remoteStock > MAX_CONTAINER_CAPACITY) {
+          writeFirebase(`inventory/c${container.id}_stock`, MAX_CONTAINER_CAPACITY);
+        }
+      }
+      if (remoteMaxStock !== MAX_CONTAINER_CAPACITY) {
+        writeFirebase(`configurations/containers/c${container.id}/maxStock`, MAX_CONTAINER_CAPACITY);
       }
     });
     const remoteLiquid = Number(inventory.liquid_ml);
     if (Number.isFinite(remoteLiquid) && remoteLiquid >= 0) {
       state.liquid.volumeMl = remoteLiquid;
-      state.liquid.level = Math.min(100, Math.max(0, Math.round((remoteLiquid / state.liquid.maxVolumeMl) * 100)));
+      if (state.liquid.maxVolumeMl) {
+        state.liquid.level = Math.min(100, Math.max(0, Math.round((remoteLiquid / state.liquid.maxVolumeMl) * 100)));
+      }
+    }
+    const remoteCapacity = Number(inventory.liquid_capacity_ml);
+    if (Number.isFinite(remoteCapacity) && remoteCapacity > 0) {
+      state.liquid.maxVolumeMl = remoteCapacity;
+      if (state.liquid.volumeMl !== null) {
+        state.liquid.level = Math.min(100, Math.max(0, Math.round((state.liquid.volumeMl / remoteCapacity) * 100)));
+      }
     }
     renderContainers();
-    if (document.getElementById('liquid-card-content')) renderLiquidModule();
+    if (document.getElementById('liquid-card-content')) refreshLiquidModuleIfIdle();
   }, error => {
     console.warn('[Firebase] Inventory listener failed:', error);
   });
 
-  firebaseDb.ref('device_status').on('value', snapshot => {
+  firebaseDb.ref(`${FIREBASE_DEVICE_PATH}/device_status`).on('value', snapshot => {
     const status = snapshot.val() || {};
     if (typeof status.online === 'boolean') state.telemetry.online = status.online;
     if (Number.isFinite(Number(status.wifi_rssi))) state.telemetry.rssi = Number(status.wifi_rssi);
     if (typeof status.ir_pill_detected === 'boolean') state.telemetry.irPillDetected = status.ir_pill_detected;
-    if (Number.isFinite(Number(status.liquid_ml))) state.telemetry.liquidMl = Number(status.liquid_ml);
+    if (Number.isFinite(Number(status.liquid_sensor_ml))) state.telemetry.liquidMl = Number(status.liquid_sensor_ml);
     state.telemetry.lastSeen = new Date();
     updateTelemetryUI();
   }, error => {
     console.warn('[Firebase] Device status listener failed:', error);
   });
 
-  firebaseDb.ref('configurations/liquid').on('value', snapshot => {
+  firebaseDb.ref(`${FIREBASE_DEVICE_PATH}/configurations/wifi`).on('value', snapshot => {
+    const configuration = snapshot.val();
+    if (!configuration || typeof configuration !== 'object') return;
+    if (typeof configuration.ssid === 'string') state.wifiConfig.ssid = configuration.ssid;
+    if (typeof configuration.password === 'string') state.wifiConfig.password = configuration.password;
+    const ssidInput = document.getElementById('wifi-ssid-input');
+    const passwordInput = document.getElementById('wifi-password-input');
+    if (ssidInput) ssidInput.value = state.wifiConfig.ssid;
+    if (passwordInput) passwordInput.value = state.wifiConfig.password;
+    updateWifiConfigUI();
+  }, error => {
+    console.warn('[Firebase] Wi-Fi configuration listener failed:', error);
+  });
+
+  firebaseDb.ref(`${FIREBASE_DEVICE_PATH}/configurations/containers`).on('value', snapshot => {
+    const configurations = snapshot.val() || {};
+    state.containers.forEach(container => {
+      const configuration = configurations[`c${container.id}`];
+      if (!configuration || typeof configuration !== 'object') return;
+      if (typeof configuration.name === 'string') container.name = configuration.name;
+      ['morning', 'lunch', 'night'].forEach(slot => {
+        if (typeof configuration[slot] === 'boolean') container[slot] = configuration[slot];
+      });
+      const dosage = Number(configuration.dosage);
+      const maxStock = Number(configuration.maxStock);
+      if (Number.isInteger(dosage) && dosage >= 1 && dosage <= 5) container.dosage = dosage;
+      container.maxStock = MAX_CONTAINER_CAPACITY;
+      if (Number(configuration.maxStock) !== MAX_CONTAINER_CAPACITY) {
+        writeFirebase(`configurations/containers/c${container.id}/maxStock`, MAX_CONTAINER_CAPACITY);
+      }
+    });
+    renderContainers();
+    renderAdherenceWidget();
+  }, error => {
+    console.warn('[Firebase] Container configuration listener failed:', error);
+  });
+
+  firebaseDb.ref(`${FIREBASE_DEVICE_PATH}/configurations/liquid`).on('value', snapshot => {
     const configuration = snapshot.val();
     if (!configuration || typeof configuration !== 'object') return;
 
+    if (typeof configuration.name === 'string') state.liquid.name = configuration.name;
     const doseMl = Number(configuration.doseMl);
     const calibMs = Number(configuration.calib_ms);
     if (configuration.doseMl === null) {
@@ -1473,16 +1775,32 @@ function attachFirebaseListeners() {
     }
     if (Number.isInteger(calibMs) && calibMs >= 100 && calibMs <= 800) {
       state.liquid.calib_ms = calibMs;
-      localStorage.setItem('liquid_calib_ms', String(calibMs));
     }
     ['morning', 'lunch', 'night'].forEach(slot => {
       if (typeof configuration[slot] === 'boolean') {
         state.liquid[slot] = configuration[slot];
       }
     });
-    if (document.getElementById('liquid-card-content')) renderLiquidModule();
+    const maxVolumeMl = Number(configuration.maxVolumeMl);
+    if (Number.isInteger(maxVolumeMl) && maxVolumeMl >= 50 && maxVolumeMl <= 500) {
+      state.liquid.maxVolumeMl = maxVolumeMl;
+      if (state.liquid.volumeMl !== null) {
+        state.liquid.level = Math.min(100, Math.max(0, Math.round((state.liquid.volumeMl / maxVolumeMl) * 100)));
+      }
+    }
+    if (document.getElementById('liquid-card-content')) refreshLiquidModuleIfIdle();
   }, error => {
     console.warn('[Firebase] Liquid configuration listener failed:', error);
+  });
+
+  firebaseDb.ref(`${FIREBASE_DEVICE_PATH}/history`).on('value', snapshot => {
+    const records = snapshot.val() || {};
+    state.history = Object.entries(records)
+      .map(([id, entry]) => ({ ...entry, id }))
+      .sort((left, right) => String(right.timestamp || '').localeCompare(String(left.timestamp || '')));
+    renderHistoryTable();
+  }, error => {
+    console.warn('[Firebase] History listener failed:', error);
   });
 }
 
@@ -1558,7 +1876,7 @@ function renderHistoryTable() {
 }
 
 function saveHistory() {
-  localStorage.setItem('dispenser_history', JSON.stringify(state.history));
+  // History is persisted by syncHistoryEntry in Firebase.
 }
 
 function exportHistoryCSV() {
@@ -1676,35 +1994,6 @@ function showToast(title, message, type = 'info') {
   }, 4500);
 }
 
-function checkAutomatedSchedules() {
-  const now = new Date();
-  const hours = now.getHours();
-  const mins = now.getMinutes();
-
-  // Morning trigger (8:00 AM)
-  if (hours === 8 && mins === 0) {
-    triggerScheduledDispense('morning');
-  }
-  // Lunch trigger (12:00 PM)
-  else if (hours === 12 && mins === 0) {
-    triggerScheduledDispense('lunch');
-  }
-  // Night trigger (8:00 PM / 20:00)
-  else if (hours === 20 && mins === 0) {
-    triggerScheduledDispense('night');
-  }
-}
-
-function triggerScheduledDispense(slot) {
-  showToast('Scheduled Dose Time', `Preparing your ${slot.toUpperCase()} medicines...`, 'info');
-  state.containers.filter(c => c[slot]).forEach(c => {
-    dispenseTablet(c.id, c.dosage);
-  });
-  if (state.liquid[slot]) {
-    dispenseLiquid();
-  }
-}
-
 function updateEsp32Ip(ip) {
   state.wifiConfig.ip = ip.trim();
   localStorage.setItem('esp32_ip', ip.trim());
@@ -1738,6 +2027,8 @@ window.confirmRefill = confirmRefill;
 window.closeRefillModal = closeRefillModal;
 window.refillLiquid = refillLiquid;
 window.updateMedicineName = updateMedicineName;
+window.updateLiquidName = updateLiquidName;
+window.updateLiquidDosage = updateLiquidDosage;
 window.toggleTimeSlot = toggleTimeSlot;
 window.exportHistoryCSV = exportHistoryCSV;
 window.requestNotificationAccess = requestNotificationAccess;
@@ -1749,4 +2040,5 @@ window.saveLiquidConfiguration = saveLiquidConfiguration;
 window.clearLiquidConfiguration = clearLiquidConfiguration;
 window.setLiquidCalibration = setLiquidCalibration;
 window.saveFirebaseConfig = saveFirebaseConfig;
+window.saveWifiConfig = saveWifiConfig;
 window.toggleCloudSync = toggleCloudSync;

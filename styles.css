@@ -603,6 +603,12 @@ body {
   box-shadow: 0 0 12px rgba(16, 185, 129, 0.25);
 }
 
+.form-control[readonly] {
+  color: var(--text-muted);
+  cursor: not-allowed;
+  background: rgba(15, 23, 42, 0.4);
+}
+
 .password-field {
   position: relative;
 }
@@ -1340,6 +1346,10 @@ body {
   border: 1px solid var(--card-border);
   border-radius: var(--radius-md);
   padding: 1rem;
+}
+
+.config-panel + .config-panel {
+  margin-top: 1rem;
 }
 
 .refill-form {

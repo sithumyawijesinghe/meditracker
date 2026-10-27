@@ -66,7 +66,7 @@
         <div class="refill-input-group">
           <label for="refill-stock-input">Current stock level</label>
           <div class="refill-number-wrap">
-            <input id="refill-stock-input" class="refill-number-input" type="number" min="1" max="20" step="1" inputmode="numeric" placeholder="1 - 20" autofocus required>
+            <input id="refill-stock-input" class="refill-number-input" type="number" min="1" max="30" step="1" inputmode="numeric" placeholder="1 - 30" autofocus required>
             <span class="refill-number-suffix">pills</span>
           </div>
           <p id="refill-modal-error" class="refill-modal-error" role="alert" aria-live="polite"></p>
@@ -78,7 +78,7 @@
             <button type="button" class="refill-chip" data-refill-value="5" onclick="selectRefillQuantity(5)">+5</button>
             <button type="button" class="refill-chip" data-refill-value="10" onclick="selectRefillQuantity(10)">+10</button>
             <button type="button" class="refill-chip" data-refill-value="15" onclick="selectRefillQuantity(15)">+15</button>
-            <button type="button" class="refill-chip refill-chip-max" data-refill-value="20" onclick="selectRefillQuantity(20)">Max (20)</button>
+            <button type="button" class="refill-chip refill-chip-max" data-refill-value="30" onclick="selectRefillQuantity(30)">Max (30)</button>
           </div>
         </div>
 
@@ -381,7 +381,7 @@
             <i class="fa-solid fa-microchip" style="color: var(--primary);"></i> ESP32 & Pin Connections
           </div>
           <p style="color: var(--text-muted); font-size: 0.9rem;">
-            ESP32 target on Wi-Fi <strong>ESW</strong>: <strong id="esp32-current-ip" style="color: #34d399;">192.168.8.20</strong>
+            ESP32 target on Wi-Fi <strong id="esp32-current-ssid">Not configured</strong>: <strong id="esp32-current-ip" style="color: #34d399;">192.168.8.20</strong>
           </p>
 
           <div style="margin-top: 1rem; background: rgba(15, 23, 42, 0.6); padding: 1rem; border-radius: 8px; border: 1px solid var(--card-border);">
@@ -391,6 +391,25 @@
               <button class="btn btn-primary" style="width: auto; padding: 0.5rem 1rem;" onclick="updateEsp32Ip(document.getElementById('esp32-ip-input').value)">
                 Save IP
               </button>
+            </div>
+
+            <div class="config-panel">
+              <div class="section-title"><i class="fa-solid fa-wifi" style="color: var(--primary);"></i> ESP32 Wi-Fi Network</div>
+              <p class="config-help">Credentials are synchronized through Firebase and sent to the configured ESP32 for NVS storage and reconnection.</p>
+              <div class="config-grid">
+                <div class="form-group">
+                  <label for="wifi-ssid-input">Wi-Fi SSID</label>
+                  <input id="wifi-ssid-input" class="form-control" type="text" autocomplete="off" placeholder="Network name">
+                </div>
+                <div class="form-group">
+                  <label for="wifi-password-input">Wi-Fi Password</label>
+                  <input id="wifi-password-input" class="form-control" type="password" autocomplete="new-password" placeholder="Network password">
+                </div>
+              </div>
+              <div class="config-actions">
+                <span class="config-help" style="margin-bottom: 0;">Current network: <strong id="configured-wifi-label">Not configured</strong></span>
+                <button class="btn btn-primary config-save-btn" onclick="saveWifiConfig()">Save Wi-Fi Settings</button>
+              </div>
             </div>
 
             <div class="config-panel">
@@ -451,7 +470,7 @@
               <div class="hw-icon"><i class="fa-solid fa-wifi"></i></div>
               <div class="hw-details">
                 <h4>Wi-Fi SSID</h4>
-                <p style="color: #34d399;">ESW</p>
+                <p id="hardware-wifi-ssid" style="color: #34d399;">Not configured</p>
               </div>
             </div>
 
@@ -459,7 +478,7 @@
               <div class="hw-icon"><i class="fa-solid fa-key"></i></div>
               <div class="hw-details">
                 <h4>Wi-Fi Password</h4>
-                <p style="color: #60a5fa;">Bpps.kjM</p>
+                <p style="color: #60a5fa;">Stored securely on ESP32</p>
               </div>
             </div>
 
